@@ -1,0 +1,6 @@
+.env
+*.exe
+/bin/
+/dist/
+/coverage.out
+/coverage.html
