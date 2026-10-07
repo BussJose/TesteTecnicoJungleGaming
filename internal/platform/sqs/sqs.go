@@ -18,11 +18,11 @@ type Client struct {
 }
 
 type Options struct {
-	Region        string
-	EndpointURL   string
-	QueueURL      string
-	StaticKey     string
-	StaticSecret  string
+	Region       string
+	EndpointURL  string
+	QueueURL     string
+	StaticKey    string
+	StaticSecret string
 }
 
 func New(ctx context.Context, opts Options) (*Client, error) {
