@@ -10,10 +10,12 @@ import (
 
 	"go.uber.org/fx"
 
+	"github.com/monii/backend-challenge-go/internal/application/outbox"
 	"github.com/monii/backend-challenge-go/internal/application/wagering"
 	"github.com/monii/backend-challenge-go/internal/config"
 	httpapi "github.com/monii/backend-challenge-go/internal/http"
 	"github.com/monii/backend-challenge-go/internal/http/health"
+	"github.com/monii/backend-challenge-go/internal/messaging"
 	"github.com/monii/backend-challenge-go/internal/platform/auth"
 	"github.com/monii/backend-challenge-go/internal/platform/metrics"
 	"github.com/monii/backend-challenge-go/internal/platform/postgres"
@@ -35,7 +37,7 @@ func Module() fx.Option {
 			newHealth,
 			newAPI,
 		),
-		fx.Invoke(registerHTTP, registerPendingWorker),
+		fx.Invoke(registerHTTP, registerPendingWorker, registerConsumer, registerOutbox),
 	)
 }
 
@@ -61,7 +63,8 @@ func newStore(pool *postgres.Pool) *postgres.Store { return postgres.NewStore(po
 
 func newSQSClient(cfg config.Config) (*sqs.Client, error) {
 	return sqs.NewClient(context.Background(), sqs.Options{
-		Region: cfg.AWSRegion, Endpoint: cfg.AWSEndpointURL, QueueURL: cfg.SQSWagerQueueURL,
+		Region: cfg.AWSRegion, Endpoint: cfg.AWSEndpointURL,
+		WagerQueueURL: cfg.SQSWagerQueueURL, EventsQueueURL: cfg.SQSEventsQueueURL,
 	})
 }
 
@@ -154,4 +157,45 @@ func registerPendingWorker(lc fx.Lifecycle, cfg config.Config, svc *wagering.Ser
 			return nil
 		},
 	})
+}
+
+// background liga uma tarefa de segundo plano ao ciclo de vida: run recebe um
+// contexto cancelado no desligamento, e o desligamento espera a tarefa
+// terminar (até o prazo do Fx).
+func background(lc fx.Lifecycle, run func(ctx context.Context)) {
+	var cancel context.CancelFunc
+	done := make(chan struct{})
+	lc.Append(fx.Hook{
+		OnStart: func(context.Context) error {
+			var ctx context.Context
+			ctx, cancel = context.WithCancel(context.Background())
+			go func() { defer close(done); run(ctx) }()
+			return nil
+		},
+		OnStop: func(ctx context.Context) error {
+			cancel()
+			select {
+			case <-done:
+			case <-ctx.Done():
+			}
+			return nil
+		},
+	})
+}
+
+// registerConsumer consome a fila de transações (inbox + processamento).
+func registerConsumer(lc fx.Lifecycle, cfg config.Config, q *sqs.Client, svc *wagering.Service, log *slog.Logger, reg *metrics.Registry) {
+	c := messaging.New(q.WagerQueue(), svc,
+		messaging.Config{Workers: cfg.ConsumerWorkers, Batch: 10, Wait: 5 * time.Second},
+		messaging.WithLogger(log), messaging.WithMetrics(reg))
+	background(lc, c.Run)
+}
+
+// registerOutbox publica os eventos gravados na outbox.
+func registerOutbox(lc fx.Lifecycle, cfg config.Config, store *postgres.Store, q *sqs.Client, log *slog.Logger, reg *metrics.Registry) {
+	oc := outbox.DefaultConfig()
+	oc.Poll, oc.Batch = cfg.OutboxPollInterval, cfg.OutboxBatch
+	d := outbox.NewDispatcher(store, q.EventPublisher(), oc,
+		outbox.WithOwner(cfg.InstanceID), outbox.WithLogger(log), outbox.WithMetrics(reg))
+	background(lc, d.Run)
 }

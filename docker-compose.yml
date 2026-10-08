@@ -80,6 +80,7 @@ services:
       DATABASE_URL: postgres://wager:wager@postgres:5432/wager?sslmode=disable
       AWS_ENDPOINT_URL: http://localstack:4566
       SQS_WAGER_QUEUE_URL: http://localstack:4566/000000000000/wager-transactions.fifo
+      SQS_EVENTS_QUEUE_URL: http://localstack:4566/000000000000/wager-events.fifo
       KEYCLOAK_URL: http://keycloak:8080                       # de onde buscar as chaves (JWKS)
       KEYCLOAK_ISSUER: http://localhost:8081/realms/wager      # "iss" dos tokens pedidos pelo host
     ports:
@@ -103,9 +104,15 @@ services:
     environment:
       DATABASE_URL: postgres://wager:wager@postgres:5432/wager?sslmode=disable
       CGO_ENABLED: "1"
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_ENDPOINT_URL: http://localstack:4566
     command: ["go", "test", "-race", "-tags", "integration", "-count=1", "./..."]
     depends_on:
       postgres:
+        condition: service_healthy
+      localstack:
         condition: service_healthy
 
 volumes:

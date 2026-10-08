@@ -17,9 +17,10 @@ type Config struct {
 	LogLevel    string
 	InstanceID  string
 
-	AWSRegion        string
-	AWSEndpointURL   string
-	SQSWagerQueueURL string
+	AWSRegion         string
+	AWSEndpointURL    string
+	SQSWagerQueueURL  string // entrada (transações)
+	SQSEventsQueueURL string // saída (eventos da outbox)
 
 	// Keycloak: Issuer é o valor esperado na claim "iss"; JWKSURL é onde buscar
 	// as chaves públicas (dentro do Docker costuma diferir do Issuer).
@@ -33,6 +34,10 @@ type Config struct {
 	BackoffBase          time.Duration
 	BackoffMax           time.Duration
 	PendingPollInterval  time.Duration
+
+	ConsumerWorkers    int
+	OutboxPollInterval time.Duration
+	OutboxBatch        int
 }
 
 // Load lê o ambiente real do processo.
@@ -74,9 +79,10 @@ func LoadFrom(lookup func(string) (string, bool)) (Config, error) {
 		LogLevel:    strings.ToLower(get("LOG_LEVEL", "info")),
 		InstanceID:  get("INSTANCE_ID", hostname),
 
-		AWSRegion:        get("AWS_REGION", "us-east-1"),
-		AWSEndpointURL:   get("AWS_ENDPOINT_URL", ""),
-		SQSWagerQueueURL: get("SQS_WAGER_QUEUE_URL", "http://localhost:4566/000000000000/wager-transactions.fifo"),
+		AWSRegion:         get("AWS_REGION", "us-east-1"),
+		AWSEndpointURL:    get("AWS_ENDPOINT_URL", ""),
+		SQSWagerQueueURL:  get("SQS_WAGER_QUEUE_URL", "http://localhost:4566/000000000000/wager-transactions.fifo"),
+		SQSEventsQueueURL: get("SQS_EVENTS_QUEUE_URL", "http://localhost:4566/000000000000/wager-events.fifo"),
 
 		KeycloakIssuer:   get("KEYCLOAK_ISSUER", realmURL),
 		KeycloakJWKSURL:  get("KEYCLOAK_JWKS_URL", realmURL+"/protocol/openid-connect/certs"),
@@ -87,6 +93,10 @@ func LoadFrom(lookup func(string) (string, bool)) (Config, error) {
 		BackoffBase:          dur("REFERENCE_BACKOFF_BASE", "1s"),
 		BackoffMax:           dur("REFERENCE_BACKOFF_MAX", "30s"),
 		PendingPollInterval:  dur("PENDING_POLL_INTERVAL", "1s"),
+
+		ConsumerWorkers:    integer("CONSUMER_WORKERS", 4),
+		OutboxPollInterval: dur("OUTBOX_POLL_INTERVAL", "200ms"),
+		OutboxBatch:        integer("OUTBOX_BATCH", 50),
 	}
 	switch c.LogLevel {
 	case "debug", "info", "warn", "error":

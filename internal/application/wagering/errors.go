@@ -24,6 +24,8 @@ var (
 	ErrUniqueViolation = errors.New("wagering: unique violation")
 	// ErrConcurrentUpdate: a versão da carteira mudou entre leitura e escrita.
 	ErrConcurrentUpdate = errors.New("wagering: concurrent wallet update")
+	// ErrInboxConflict: o mesmo messageId chegou com conteúdo diferente.
+	ErrInboxConflict = errors.New("wagering: message id reused with different payload")
 	// ErrTransient: falha temporária (deadlock, timeout, conexão). Pode repetir.
 	ErrTransient = errors.New("wagering: transient failure")
 )

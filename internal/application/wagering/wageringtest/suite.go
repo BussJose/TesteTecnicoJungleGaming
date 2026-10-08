@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/monii/backend-challenge-go/internal/application/outbox"
 	"github.com/monii/backend-challenge-go/internal/application/wagering"
 	"github.com/monii/backend-challenge-go/internal/domain/id"
 	"github.com/monii/backend-challenge-go/internal/domain/wager"
@@ -36,6 +37,10 @@ type Env struct {
 	Clock      *FakeClock
 	// Events lista os tipos de evento gravados na outbox de uma carteira, em ordem.
 	Events func(ctx context.Context, walletID id.ID) ([]wager.EventType, error)
+	// Outbox é o armazenamento lido pelos publicadores.
+	Outbox outbox.Store
+	// OutboxPending conta os eventos da carteira ainda não publicados.
+	OutboxPending func(ctx context.Context, walletID id.ID) (int, error)
 }
 
 const provider = "provider-a"
@@ -206,6 +211,11 @@ func RunSuite(t *testing.T, newEnv func(t *testing.T) *Env) {
 		{"ReferenceMismatches", testMismatches},
 		{"WalletMismatchAndNotFound", testWalletChecks},
 		{"TwoConcurrentPendingResolvers", testConcurrentResolvers},
+		{"InboxDeduplicatesMessages", testInbox},
+		{"InboxIsAtomicWithBusiness", testInboxAtomic},
+		{"OutboxPublishesOnceInOrderWithTwoPublishers", testOutboxTwoPublishers},
+		{"OutboxRetriesAfterPublishFailure", testOutboxRetry},
+		{"OutboxLeaseTakeover", testOutboxLease},
 	}
 	for _, s := range scenarios {
 		s := s

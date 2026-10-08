@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/monii/backend-challenge-go/internal/application/outbox"
 	"github.com/monii/backend-challenge-go/internal/application/wagering"
 	"github.com/monii/backend-challenge-go/internal/domain/id"
 	"github.com/monii/backend-challenge-go/internal/domain/money"
@@ -26,22 +28,32 @@ type Store struct{ db txStarter }
 // NewStore cria o Store. Normalmente recebe o *pgxpool.Pool.
 func NewStore(db txStarter) *Store { return &Store{db: db} }
 
-var _ wagering.UnitOfWork = (*Store)(nil)
+var (
+	_ wagering.UnitOfWork = (*Store)(nil)
+	_ outbox.Store        = (*Store)(nil)
+)
 
 // Do abre uma transação READ COMMITTED, executa fn e faz commit; se fn
 // devolver erro, faz rollback. A correção sob concorrência vem do
 // SELECT ... FOR UPDATE da carteira (feito pelo serviço), das restrições
 // únicas e do UPDATE com checagem de versão, não do nível de isolamento.
 func (s *Store) Do(ctx context.Context, fn func(ctx context.Context, r wagering.Repos) error) error {
+	return s.inTx(ctx, func(q querier) error {
+		return fn(ctx, wagering.Repos{
+			Wallets: walletRepo{q}, Transactions: txRepo{q}, Ledger: ledgerRepo{q},
+			Outbox: outboxRepo{q}, Inbox: inboxRepo{q},
+		})
+	})
+}
+
+// inTx abre uma transação READ COMMITTED, executa fn e faz commit; se fn
+// devolver erro, faz rollback.
+func (s *Store) inTx(ctx context.Context, fn func(q querier) error) error {
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return mapErr(err)
 	}
-	q := querier{tx}
-	err = fn(ctx, wagering.Repos{
-		Wallets: walletRepo{q}, Transactions: txRepo{q}, Ledger: ledgerRepo{q}, Outbox: outboxRepo{q},
-	})
-	if err != nil {
+	if err := fn(querier{tx}); err != nil {
 		// O rollback não pode ser cancelado junto com a requisição.
 		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
@@ -460,8 +472,8 @@ type outboxRepo struct{ q querier }
 func (r outboxRepo) Insert(ctx context.Context, ev wager.Event) error {
 	_, err := r.q.tx.Exec(ctx, `
 INSERT INTO outbox_events
-    (event_id, aggregate_id, event_type, version, correlation_id, causation_id, payload, occurred_at)
-VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5, $6, $7::text::jsonb, $8)`,
+    (event_id, aggregate_id, event_type, version, correlation_id, causation_id, payload, occurred_at, next_attempt_at)
+VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5, $6, $7::text::jsonb, $8, $8)`,
 		ev.ID().String(), ev.AggregateID().String(), string(ev.Type()), ev.Version(),
 		ev.CorrelationID(), nullStr(ev.CausationID()), string(ev.Payload()), ev.OccurredAt())
 	return mapErr(err)
@@ -490,4 +502,154 @@ func (s *Store) Events(ctx context.Context, walletID id.ID) ([]wager.EventType, 
 		out = append(out, wager.EventType(t))
 	}
 	return out, mapErr(rows.Err())
+}
+
+// ============================================================== inbox
+
+type inboxRepo struct{ q querier }
+
+// Begin registra a mensagem na inbox. Se já existia, devolve inserted=false
+// (reentrega); se existia com outro conteúdo, devolve ErrInboxConflict.
+// Roda dentro da mesma transação do processamento: se ela falhar, o registro
+// some junto e a mensagem pode ser reprocessada.
+func (r inboxRepo) Begin(ctx context.Context, consumer, messageID, payloadHash string, now time.Time) (bool, error) {
+	tag, err := r.q.tx.Exec(ctx, `
+INSERT INTO inbox_messages (consumer_name, message_id, payload_hash, received_at)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (consumer_name, message_id) DO NOTHING`, consumer, messageID, payloadHash, now)
+	if err != nil {
+		return false, mapErr(err)
+	}
+	if tag.RowsAffected() == 1 {
+		return true, nil
+	}
+	var stored string
+	if err := r.q.tx.QueryRow(ctx,
+		`SELECT payload_hash FROM inbox_messages WHERE consumer_name = $1 AND message_id = $2`,
+		consumer, messageID).Scan(&stored); err != nil {
+		return false, mapErr(err)
+	}
+	if stored != payloadHash {
+		return false, wagering.ErrInboxConflict
+	}
+	return false, nil
+}
+
+// Complete marca a mensagem como concluída.
+func (r inboxRepo) Complete(ctx context.Context, consumer, messageID string, now time.Time) error {
+	_, err := r.q.tx.Exec(ctx,
+		`UPDATE inbox_messages SET completed_at = $3 WHERE consumer_name = $1 AND message_id = $2`,
+		consumer, messageID, now)
+	return mapErr(err)
+}
+
+// ============================================================== outbox.Store
+
+// Claim reserva eventos para publicação. Só é elegível o evento mais antigo
+// ainda não publicado de cada carteira (NOT EXISTS), o que preserva a ordem
+// por agregado; SKIP LOCKED evita que dois publicadores peguem o mesmo evento
+// e o lease (locked_until) permite assumir o trabalho de quem caiu.
+func (s *Store) Claim(ctx context.Context, now time.Time, limit int, lease time.Duration, owner string) ([]outbox.Record, error) {
+	var out []outbox.Record
+	err := s.inTx(ctx, func(q querier) error {
+		rows, err := q.tx.Query(ctx, `
+UPDATE outbox_events o SET locked_by = $1, locked_until = $2
+WHERE o.event_id IN (
+    SELECT c.event_id FROM outbox_events c
+    WHERE c.published_at IS NULL
+      AND c.next_attempt_at <= $3
+      AND (c.locked_until IS NULL OR c.locked_until <= $3)
+      AND NOT EXISTS (
+          SELECT 1 FROM outbox_events e
+          WHERE e.aggregate_id = c.aggregate_id AND e.seq < c.seq AND e.published_at IS NULL)
+    ORDER BY c.seq
+    LIMIT $4
+    FOR UPDATE OF c SKIP LOCKED)
+RETURNING o.seq, o.event_id::text, o.aggregate_id::text, o.event_type, o.version, o.correlation_id,
+          o.causation_id, o.payload::text, o.occurred_at, o.attempts`,
+			owner, now.Add(lease), now, limit)
+		if err != nil {
+			return mapErr(err)
+		}
+		defer rows.Close()
+		type withSeq struct {
+			seq int64
+			rec outbox.Record
+		}
+		var got []withSeq
+		for rows.Next() {
+			var (
+				seq                 int64
+				eid, aid, typ, corr string
+				causation           *string
+				payload             string
+				version, attempts   int
+				occurred            time.Time
+			)
+			if err := rows.Scan(&seq, &eid, &aid, &typ, &version, &corr, &causation, &payload, &occurred, &attempts); err != nil {
+				return mapErr(err)
+			}
+			ev, err := id.Parse(eid)
+			if err != nil {
+				return err
+			}
+			ag, err := id.Parse(aid)
+			if err != nil {
+				return err
+			}
+			rec := outbox.Record{
+				EventID: ev, AggregateID: ag, Type: wager.EventType(typ), Version: version,
+				CorrelationID: corr, Payload: []byte(payload), OccurredAt: occurred.UTC(), Attempts: attempts,
+			}
+			if causation != nil {
+				rec.CausationID = *causation
+			}
+			got = append(got, withSeq{seq, rec})
+		}
+		if err := rows.Err(); err != nil {
+			return mapErr(err)
+		}
+		// RETURNING não garante ordem: ordena por seq.
+		sort.Slice(got, func(i, j int) bool { return got[i].seq < got[j].seq })
+		out = out[:0]
+		for _, g := range got {
+			out = append(out, g.rec)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// MarkPublished marca o evento como publicado e libera a reserva.
+func (s *Store) MarkPublished(ctx context.Context, eventID id.ID, now time.Time) error {
+	return s.inTx(ctx, func(q querier) error {
+		_, err := q.tx.Exec(ctx, `
+UPDATE outbox_events SET published_at = $2, locked_by = NULL, locked_until = NULL
+WHERE event_id = $1::text::uuid AND published_at IS NULL`, eventID.String(), now)
+		return mapErr(err)
+	})
+}
+
+// Release devolve o evento para nova tentativa.
+func (s *Store) Release(ctx context.Context, eventID id.ID, nextAttempt time.Time) error {
+	return s.inTx(ctx, func(q querier) error {
+		_, err := q.tx.Exec(ctx, `
+UPDATE outbox_events SET attempts = attempts + 1, next_attempt_at = $2, locked_by = NULL, locked_until = NULL
+WHERE event_id = $1::text::uuid AND published_at IS NULL`, eventID.String(), nextAttempt)
+		return mapErr(err)
+	})
+}
+
+// PendingOutbox conta os eventos da carteira ainda não publicados (testes).
+func (s *Store) PendingOutbox(ctx context.Context, walletID id.ID) (int, error) {
+	var n int
+	err := s.inTx(ctx, func(q querier) error {
+		return mapErr(q.tx.QueryRow(ctx,
+			`SELECT count(*) FROM outbox_events WHERE aggregate_id = $1::text::uuid AND published_at IS NULL`,
+			walletID.String()).Scan(&n))
+	})
+	return n, err
 }

@@ -32,6 +32,15 @@ type Outcome struct {
 	Transaction      *wager.WagerTransaction
 	Balance          money.Money // saldo observado no processamento (ou atual, se ainda pendente)
 	IdempotentReplay bool
+	// DuplicateMessage: a mensagem (SQS) já tinha sido processada; nada foi feito.
+	DuplicateMessage bool
+}
+
+// InboxMessage identifica uma mensagem consumida (inbox).
+type InboxMessage struct {
+	Consumer    string // nome do consumidor
+	MessageID   string // identidade da mensagem na fila
+	PayloadHash string // hash do corpo recebido
 }
 
 // Submit processa uma operação de forma idempotente e atômica.
@@ -41,6 +50,21 @@ type Outcome struct {
 // (provedor, id externo), decide o resultado, grava transação + ledger +
 // saldo + eventos na outbox. Nada é publicado antes do commit.
 func (s *Service) Submit(ctx context.Context, cmd SubmitCommand) (*Outcome, error) {
+	return s.submit(ctx, cmd, nil)
+}
+
+// SubmitMessage é o Submit de uma mensagem da fila: a inbox, o negócio, o
+// ledger e a outbox são gravados na MESMA transação. Se o processo cair depois
+// do commit e antes de confirmar a mensagem, a reentrega cai na inbox e não
+// repete nada.
+func (s *Service) SubmitMessage(ctx context.Context, m InboxMessage, cmd SubmitCommand) (*Outcome, error) {
+	if m.Consumer == "" || m.MessageID == "" || m.PayloadHash == "" {
+		return nil, fmt.Errorf("%w: inbox message requires consumer, id and payload hash", ErrInvalidInput)
+	}
+	return s.submit(ctx, cmd, &m)
+}
+
+func (s *Service) submit(ctx context.Context, cmd SubmitCommand, inbox *InboxMessage) (*Outcome, error) {
 	kind, err := wager.ParseExternalKind(cmd.Kind)
 	if err != nil {
 		return nil, err
@@ -52,6 +76,16 @@ func (s *Service) Submit(ctx context.Context, cmd SubmitCommand) (*Outcome, erro
 	var out *Outcome
 	err = s.retry(ctx, func(ctx context.Context, r Repos) error {
 		now := s.now()
+		if inbox != nil {
+			inserted, err := r.Inbox.Begin(ctx, inbox.Consumer, inbox.MessageID, inbox.PayloadHash, now)
+			if err != nil {
+				return err
+			}
+			if !inserted {
+				out = &Outcome{DuplicateMessage: true}
+				return nil
+			}
+		}
 		t, err := wager.NewExternal(wager.NewExternalParams{
 			ID: id.New(), ProviderID: cmd.ProviderID, ExternalTransactionID: cmd.ExternalTransactionID,
 			IdempotencyKey: cmd.IdempotencyKey, WalletID: cmd.WalletID, PlayerID: cmd.PlayerID,
@@ -72,19 +106,26 @@ func (s *Service) Submit(ctx context.Context, cmd SubmitCommand) (*Outcome, erro
 				return ErrIdempotencyConflict
 			}
 			out = &Outcome{Transaction: ex, Balance: balanceOf(ex, w), IdempotentReplay: true}
-			return nil
+			return complete(ctx, r, inbox, now)
 		}
 		x := &run{s: s, r: r, w: w, now: now}
 		if err := x.settle(ctx, t, true); err != nil {
 			return err
 		}
 		out = &Outcome{Transaction: t, Balance: balanceOf(t, w)}
-		return nil
+		return complete(ctx, r, inbox, now)
 	})
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+func complete(ctx context.Context, r Repos, inbox *InboxMessage, now time.Time) error {
+	if inbox == nil {
+		return nil
+	}
+	return r.Inbox.Complete(ctx, inbox.Consumer, inbox.MessageID, now)
 }
 
 func (s *Service) findExisting(ctx context.Context, r Repos, t *wager.WagerTransaction) (*wager.WagerTransaction, error) {

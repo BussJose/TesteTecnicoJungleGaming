@@ -68,8 +68,19 @@ type OutboxRepo interface {
 	Insert(ctx context.Context, ev wager.Event) error
 }
 
+// InboxRepo deduplica mensagens consumidas (inbox transacional).
+type InboxRepo interface {
+	// Begin registra a mensagem. inserted=false (sem erro) significa que ela já
+	// foi processada antes: o consumidor só precisa confirmá-la. Se o mesmo
+	// messageId voltar com outro conteúdo, devolve ErrInboxConflict.
+	Begin(ctx context.Context, consumer, messageID, payloadHash string, now time.Time) (inserted bool, err error)
+	// Complete marca a mensagem como concluída (na mesma transação do negócio).
+	Complete(ctx context.Context, consumer, messageID string, now time.Time) error
+}
+
 // Repos agrupa os repositórios de uma unidade de trabalho.
 type Repos struct {
+	Inbox        InboxRepo
 	Wallets      WalletRepo
 	Transactions TransactionRepo
 	Ledger       LedgerRepo

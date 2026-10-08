@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,14 +31,17 @@ func newEnv(t *testing.T) (*wageringtest.Env, *pgxpool.Pool) {
 	pool := pgtest.NewDatabase(t)
 	store := postgres.NewStore(pool)
 	clock := wageringtest.NewFakeClock(time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC))
-	n := 0
+	var n atomic.Int64
 	return &wageringtest.Env{
 		Clock:  clock,
 		Events: store.Events,
+		Outbox: store,
+		OutboxPending: func(ctx context.Context, w id.ID) (int, error) {
+			return store.PendingOutbox(ctx, w)
+		},
 		NewService: func() *wagering.Service {
-			n++
 			return wagering.NewService(store, wagering.DefaultConfig(),
-				wagering.WithClock(clock.Now), wagering.WithInstanceID(fmt.Sprintf("instance-%d", n)))
+				wagering.WithClock(clock.Now), wagering.WithInstanceID(fmt.Sprintf("instance-%d", n.Add(1))))
 		},
 	}, pool
 }

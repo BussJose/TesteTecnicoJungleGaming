@@ -1,9 +1,4 @@
-# Normaliza finais de linha: LF no repositório e no working copy.
-# Evita que scripts .sh montados em containers Linux quebrem com CRLF.
-* text=auto eol=lf
 *.sh text eol=lf
-*.go text eol=lf
 *.sql text eol=lf
 *.yml text eol=lf
-*.yaml text eol=lf
-*.json text eol=lf
+Dockerfile text eol=lf

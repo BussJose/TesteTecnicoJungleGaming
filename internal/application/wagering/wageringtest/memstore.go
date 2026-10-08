@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/monii/backend-challenge-go/internal/application/outbox"
 	"github.com/monii/backend-challenge-go/internal/application/wagering"
 	"github.com/monii/backend-challenge-go/internal/domain/id"
 	"github.com/monii/backend-challenge-go/internal/domain/money"
@@ -27,11 +28,27 @@ type lease struct {
 	until time.Time
 }
 
+type outboxRow struct {
+	ev        wager.Event
+	seq       int64
+	attempts  int
+	next      time.Time
+	lockedBy  string
+	lockedTil time.Time
+	published bool
+}
+
+type inboxRow struct {
+	hash      string
+	completed bool
+}
+
 type state struct {
 	wallets map[id.ID]walletRow
 	txs     map[id.ID]wager.TransactionRecord
 	ledger  map[id.ID][]wagering.LedgerRow
-	outbox  []wager.Event
+	outbox  []outboxRow
+	inbox   map[string]inboxRow
 	leases  map[id.ID]lease
 	seq     int64
 }
@@ -41,7 +58,8 @@ func (s *state) clone() *state {
 		wallets: make(map[id.ID]walletRow, len(s.wallets)),
 		txs:     make(map[id.ID]wager.TransactionRecord, len(s.txs)),
 		ledger:  make(map[id.ID][]wagering.LedgerRow, len(s.ledger)),
-		outbox:  append([]wager.Event(nil), s.outbox...),
+		outbox:  append([]outboxRow(nil), s.outbox...),
+		inbox:   make(map[string]inboxRow, len(s.inbox)),
 		leases:  make(map[id.ID]lease, len(s.leases)),
 		seq:     s.seq,
 	}
@@ -56,6 +74,9 @@ func (s *state) clone() *state {
 	}
 	for k, v := range s.leases {
 		c.leases[k] = v
+	}
+	for k, v := range s.inbox {
+		c.inbox[k] = v
 	}
 	return c
 }
@@ -72,7 +93,7 @@ type MemStore struct {
 func NewMemStore() *MemStore {
 	return &MemStore{st: &state{
 		wallets: map[id.ID]walletRow{}, txs: map[id.ID]wager.TransactionRecord{},
-		ledger: map[id.ID][]wagering.LedgerRow{}, leases: map[id.ID]lease{},
+		ledger: map[id.ID][]wagering.LedgerRow{}, leases: map[id.ID]lease{}, inbox: map[string]inboxRow{},
 	}}
 }
 
@@ -82,7 +103,7 @@ func (m *MemStore) Do(ctx context.Context, fn func(ctx context.Context, r wageri
 	defer m.mu.Unlock()
 	snap := m.st.clone()
 	st := m.st
-	err := fn(ctx, wagering.Repos{Wallets: walletRepo{st}, Transactions: txRepo{st}, Ledger: ledgerRepo{st}, Outbox: outboxRepo{st}})
+	err := fn(ctx, wagering.Repos{Wallets: walletRepo{st}, Transactions: txRepo{st}, Ledger: ledgerRepo{st}, Outbox: outboxRepo{st}, Inbox: inboxRepo{st}})
 	if err != nil {
 		m.st = snap
 	}
@@ -95,8 +116,8 @@ func (m *MemStore) Events(_ context.Context, walletID id.ID) ([]wager.EventType,
 	defer m.mu.Unlock()
 	var out []wager.EventType
 	for _, e := range m.st.outbox {
-		if e.AggregateID() == walletID {
-			out = append(out, e.Type())
+		if e.ev.AggregateID() == walletID {
+			out = append(out, e.ev.Type())
 		}
 	}
 	return out, nil
@@ -106,6 +127,7 @@ type walletRepo struct{ st *state }
 type txRepo struct{ st *state }
 type ledgerRepo struct{ st *state }
 type outboxRepo struct{ st *state }
+type inboxRepo struct{ st *state }
 
 // ---- WalletRepo
 
@@ -294,6 +316,97 @@ func (r ledgerRepo) Summarize(_ context.Context, walletID id.ID) (wagering.Ledge
 // ---- OutboxRepo
 
 func (r outboxRepo) Insert(_ context.Context, ev wager.Event) error {
-	r.st.outbox = append(r.st.outbox, ev)
+	r.st.seq++
+	r.st.outbox = append(r.st.outbox, outboxRow{ev: ev, seq: r.st.seq, next: ev.OccurredAt()})
 	return nil
+}
+
+// ---- InboxRepo
+
+func (r inboxRepo) Begin(_ context.Context, consumer, messageID, hash string, _ time.Time) (bool, error) {
+	k := consumer + "\x00" + messageID
+	if row, ok := r.st.inbox[k]; ok {
+		if row.hash != hash {
+			return false, wagering.ErrInboxConflict
+		}
+		return false, nil
+	}
+	r.st.inbox[k] = inboxRow{hash: hash}
+	return true, nil
+}
+
+func (r inboxRepo) Complete(_ context.Context, consumer, messageID string, _ time.Time) error {
+	k := consumer + "\x00" + messageID
+	row := r.st.inbox[k]
+	row.completed = true
+	r.st.inbox[k] = row
+	return nil
+}
+
+// ---- outbox.Store (a publicação lê a outbox fora de uma unidade de trabalho)
+
+var _ outbox.Store = (*MemStore)(nil)
+
+func (m *MemStore) Claim(_ context.Context, now time.Time, limit int, lease time.Duration, owner string) ([]outbox.Record, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	blocked := map[id.ID]bool{} // agregados com evento anterior não publicado
+	var out []outbox.Record
+	for i := range m.st.outbox {
+		row := &m.st.outbox[i]
+		if row.published {
+			continue
+		}
+		agg := row.ev.AggregateID()
+		wasBlocked := blocked[agg]
+		blocked[agg] = true
+		if wasBlocked || len(out) >= limit || row.next.After(now) || row.lockedTil.After(now) {
+			continue
+		}
+		row.lockedBy, row.lockedTil = owner, now.Add(lease)
+		out = append(out, outbox.Record{
+			EventID: row.ev.ID(), AggregateID: agg, Type: row.ev.Type(), Version: row.ev.Version(),
+			CorrelationID: row.ev.CorrelationID(), CausationID: row.ev.CausationID(),
+			Payload: row.ev.Payload(), OccurredAt: row.ev.OccurredAt(), Attempts: row.attempts,
+		})
+	}
+	return out, nil
+}
+
+func (m *MemStore) MarkPublished(_ context.Context, eventID id.ID, _ time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.st.outbox {
+		if m.st.outbox[i].ev.ID() == eventID {
+			m.st.outbox[i].published = true
+			m.st.outbox[i].lockedBy, m.st.outbox[i].lockedTil = "", time.Time{}
+		}
+	}
+	return nil
+}
+
+func (m *MemStore) Release(_ context.Context, eventID id.ID, next time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.st.outbox {
+		if row := &m.st.outbox[i]; row.ev.ID() == eventID && !row.published {
+			row.attempts++
+			row.next = next
+			row.lockedBy, row.lockedTil = "", time.Time{}
+		}
+	}
+	return nil
+}
+
+// PendingOutbox devolve quantos eventos da carteira ainda não foram publicados.
+func (m *MemStore) PendingOutbox(walletID id.ID) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, row := range m.st.outbox {
+		if row.ev.AggregateID() == walletID && !row.published {
+			n++
+		}
+	}
+	return n
 }
