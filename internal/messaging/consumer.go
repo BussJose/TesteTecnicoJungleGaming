@@ -238,8 +238,15 @@ func (c *Consumer) decide(ctx context.Context, m Message) (Result, error) {
 	}, cmd)
 	switch {
 	case err == nil && out.DuplicateMessage:
+		c.log.Info("message_duplicate", slog.String("messageId", env.MessageID), slog.String("correlationId", cmd.IdempotencyKey))
 		return ResultDuplicate, nil
 	case err == nil:
+		t := out.Transaction
+		c.log.Info("message_processed", slog.String("messageId", env.MessageID),
+			slog.String("correlationId", cmd.IdempotencyKey), slog.String("transactionId", t.ID().String()),
+			slog.String("walletId", t.WalletID().String()), slog.String("providerId", cmd.ProviderID),
+			slog.String("kind", string(t.Kind())), slog.String("status", string(t.Status())),
+			slog.String("failureCode", string(t.FailureCode())), slog.Bool("idempotentReplay", out.IdempotentReplay))
 		return ResultProcessed, nil
 	case errors.Is(err, wagering.ErrInvalidInput),
 		errors.Is(err, wagering.ErrInboxConflict),

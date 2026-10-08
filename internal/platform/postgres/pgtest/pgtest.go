@@ -21,6 +21,14 @@ import (
 // Se DATABASE_URL não estiver definida, o teste é ignorado.
 func NewDatabase(t testing.TB) *pgxpool.Pool {
 	t.Helper()
+	pool, _ := NewDatabaseURL(t)
+	return pool
+}
+
+// NewDatabaseURL é como NewDatabase e devolve também a URL de conexão do
+// banco criado (para testes que sobem a aplicação inteira).
+func NewDatabaseURL(t testing.TB) (*pgxpool.Pool, string) {
+	t.Helper()
 	admin := os.Getenv("DATABASE_URL")
 	if admin == "" {
 		t.Skip("DATABASE_URL não definida: teste de integração ignorado")
@@ -73,5 +81,5 @@ func NewDatabase(t testing.TB) *pgxpool.Pool {
 			t.Fatalf("apply %s: %v", f, err)
 		}
 	}
-	return pool
+	return pool, u.String()
 }

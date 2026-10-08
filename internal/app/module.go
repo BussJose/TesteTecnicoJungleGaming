@@ -68,11 +68,13 @@ func newSQSClient(cfg config.Config) (*sqs.Client, error) {
 	})
 }
 
-func newWageringService(store *postgres.Store, cfg config.Config) *wagering.Service {
+func newWageringService(store *postgres.Store, cfg config.Config, reg *metrics.Registry) *wagering.Service {
+	conflicts := reg.Counter("wallet_concurrency_conflicts_total", "Conflitos de concorrência que provocaram nova tentativa.", "reason")
 	wc := wagering.DefaultConfig()
 	wc.ReferenceTTL, wc.MaxReferenceAttempts = cfg.ReferenceTTL, cfg.MaxReferenceAttempts
 	wc.BackoffBase, wc.BackoffMax = cfg.BackoffBase, cfg.BackoffMax
-	return wagering.NewService(store, wc, wagering.WithInstanceID(cfg.InstanceID))
+	return wagering.NewService(store, wc, wagering.WithInstanceID(cfg.InstanceID),
+		wagering.WithConflictObserver(func(reason string) { conflicts.Inc(reason) }))
 }
 
 func newVerifier(cfg config.Config) *auth.Verifier {

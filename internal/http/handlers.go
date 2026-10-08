@@ -248,9 +248,17 @@ func (a *API) submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	t := out.Transaction
-	if !out.IdempotentReplay {
+	if out.IdempotentReplay {
+		a.m.replays.Inc(string(t.Kind()))
+	} else {
 		a.m.transactions.Inc(string(t.Kind()), string(t.Status()))
 	}
+	a.log.InfoContext(r.Context(), "transaction_result",
+		slog.String("request_id", requestID(r.Context())), slog.String("correlationId", key),
+		slog.String("transactionId", t.ID().String()), slog.String("walletId", t.WalletID().String()),
+		slog.String("providerId", ident.ProviderID), slog.String("kind", string(t.Kind())),
+		slog.String("status", string(t.Status())), slog.String("failureCode", string(t.FailureCode())),
+		slog.Bool("idempotentReplay", out.IdempotentReplay))
 	d := toTransactionDTO(t)
 	bal, replay := out.Balance, out.IdempotentReplay
 	d.Balance, d.IdempotentReplay = &bal, &replay

@@ -82,6 +82,7 @@ type Dispatcher struct {
 
 	published *metrics.CounterVec
 	failures  *metrics.CounterVec
+	lag       *metrics.HistogramVec
 }
 
 // Option personaliza o Dispatcher.
@@ -101,6 +102,8 @@ func WithMetrics(r *metrics.Registry) Option {
 	return func(d *Dispatcher) {
 		d.published = r.Counter("outbox_events_published_total", "Eventos publicados.", "event_type")
 		d.failures = r.Counter("outbox_publish_failures_total", "Falhas ao publicar eventos.", "event_type")
+		d.lag = r.Histogram("outbox_publish_lag_seconds", "Tempo entre a gravação do evento e a publicação.",
+			[]float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300}, "event_type")
 	}
 }
 
@@ -155,6 +158,7 @@ func (d *Dispatcher) Cycle(ctx context.Context) (int, error) {
 		published++
 		if d.published != nil {
 			d.published.Inc(string(r.Type))
+			d.lag.Observe(d.now().Sub(r.OccurredAt).Seconds(), string(r.Type))
 		}
 	}
 	return published, errors.Join(errs...)

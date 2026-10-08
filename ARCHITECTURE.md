@@ -207,9 +207,11 @@ não marcado, é reenviado com o mesmo `eventId` e deduplicado); o pool PostgreS
 
 ## 11. Observabilidade
 
-- Logs JSON (`slog`) com `instance`, `requestId`/`correlationId`.
-- `/metrics`: `http_requests_total`, `http_request_duration_seconds`, `wager_transactions_total{kind,status}`,
-  `queue_messages_total{result}`, `outbox_events_published_total`, `outbox_publish_failures_total`.
+- Logs JSON (`slog`) com `instance` e, quando existem, `request_id`, `correlationId` (a chave de idempotência, que também
+  é o `correlationId` dos eventos), `messageId`, `transactionId`, `walletId` e `providerId`. Há uma linha por requisição
+  (`http_request`), uma por resultado de operação (`transaction_result`) e uma por mensagem consumida
+  (`message_processed`, `message_duplicate`). Credenciais, tokens e o corpo completo das operações nunca são registrados.
+- `/metrics` (ver a lista no §13).
 - `/health/live` (processo vivo) e `/health/ready` (PostgreSQL e as duas filas respondem).
 
 ## 12. Estratégia de testes
@@ -220,7 +222,8 @@ Mesmas regras, três níveis, **sem mocks de PostgreSQL/SQS/IdP** nos testes de 
 2. Suíte de aplicação (`wageringtest.RunSuite`): roda em memória (rápida, com `-race`) **e** no PostgreSQL real —
    incluindo 50 requisições idênticas, duas apostas de 80,00 sobre 100,00, várias instâncias do serviço,
    referências pendentes, inbox, e dois publicadores de outbox.
-3. Integração: HTTP com ≥ 3 instâncias da API sobre o mesmo PostgreSQL; autenticação contra o **Keycloak real**;
+3. Integração: a aplicação inteira montada pelo Fx (composição, partida, desligamento e retomada) sobre
+   infraestrutura real (`TestAppLifecycleWithRealInfrastructure`); HTTP com ≥ 3 instâncias da API sobre o mesmo PostgreSQL; autenticação contra o **Keycloak real**;
    SQS real (LocalStack) para consumidor interrompido após o commit, mensagens duplicadas, DLQ e publicadores
    concorrentes; guardas do banco. As "instâncias" dos testes são serviços independentes (cada um com seu pool, seu
    cache de chaves e suas métricas) no mesmo processo; para processos separados de verdade use
@@ -236,10 +239,12 @@ Mesmas regras, três níveis, **sem mocks de PostgreSQL/SQS/IdP** nos testes de 
 - **Ordem na saída**: garantida por carteira (FIFO group + regra de elegibilidade); não há ordem global.
 - **Entrega pelo menos uma vez** na saída; consumidores externos devem deduplicar por `eventId`.
 - **Polling** da outbox (200 ms) em vez de `LISTEN/NOTIFY`: mais simples e robusto; custo é uma pequena latência.
-- **Métricas**: há contadores de requisições, operações por tipo/estado, mensagens consumidas por resultado
-  (processada, duplicada, veneno, nova tentativa), eventos publicados e falhas de publicação, e divergências de
-  conciliação. Não foram implementados medidores de atraso da outbox, de conflitos de concorrência nem tracing
-  (OpenTelemetry), que são opcionais.
+- **Métricas** (`/metrics`): `http_requests_total`, `http_request_duration_seconds` (latência),
+  `wager_transactions_total{kind,status}`, `idempotent_replays_total` (duplicatas HTTP),
+  `queue_messages_total{result}` (processada, duplicada, veneno — as de resultado `poison` seguem para a DLQ —, nova
+  tentativa), `outbox_events_published_total`, `outbox_publish_failures_total`, `outbox_publish_lag_seconds` (atraso da
+  outbox), `wallet_concurrency_conflicts_total{reason}` e `reconciliation_divergences_total`. Tracing
+  (OpenTelemetry) é opcional e não foi implementado.
 - **Testes de carga**: não incluídos (opcionais no desafio).
 - **Token expirado** é coberto pelos testes unitários do verificador (IdP de teste com relógio controlável); os testes com
   Keycloak real cobrem ausência, adulteração, papel errado e isolamento entre provedores.

@@ -14,7 +14,7 @@ O desenho e as decisões estão em [`ARCHITECTURE.md`](ARCHITECTURE.md).
 | Para quê | O que precisa |
 |---|---|
 | Subir tudo | Docker Desktop (com `docker compose`) |
-| Testes no seu computador | Go 1.22 ou mais novo |
+| Testes no seu computador | Go 1.24 ou mais novo (o `go.mod` declara 1.24; a imagem Docker usa Go 1.27) |
 | Testes com `-race` | Docker (o `-race` do Go exige cgo; use o serviço `test` do compose) |
 
 ## 2. Subir o ambiente
@@ -229,6 +229,23 @@ go test -tags integration -count=1 ./...
 Testes de integração sem as variáveis correspondentes (`DATABASE_URL`, `AWS_ENDPOINT_URL`, `KEYCLOAK_URL`) são ignorados (`SKIP`); o serviço `test` do compose define todas. Cada teste de integração cria o próprio banco temporário (e filas com nome único), aplica as migrations de
 `migrations/` e apaga tudo no fim.
 
+### Multi-instância e simulação de falhas (manual)
+
+Com o ambiente de pé (`docker compose up --build --scale api=3`), cada instância é um processo/container separado,
+com seu próprio pool e memória, todas sobre o mesmo PostgreSQL e as mesmas filas (`docker compose ps` mostra as portas).
+
+```bash
+docker compose kill api                  # derruba as instâncias sem desligamento limpo (queda abrupta)
+docker compose up -d api                 # sobe de novo: mensagens e eventos pendentes são retomados
+docker compose pause postgres            # banco indisponível: a API responde 503, o consumidor não apaga mensagens
+docker compose unpause postgres
+docker compose stop localstack           # SQS indisponível: /health/ready falha e a outbox acumula eventos
+docker compose start localstack
+```
+
+Os testes automáticos que cobrem esses cenários estão na tabela abaixo. Os de integração usam a *build tag*
+`integration` (`-tags integration`); sem ela, `go test ./...` roda só os testes que não dependem de infraestrutura.
+
 ### Onde está cada teste exigido
 
 | Cenário | Teste |
@@ -241,6 +258,7 @@ Testes de integração sem as variáveis correspondentes (`DATABASE_URL`, `AWS_E
 | Refund/rollback antes da referência | `RefundBeforeBetThenResolve`, `PendingReferenceExpires`, `TwoConcurrentPendingResolvers` |
 | Mensagem duplicada / veneno → DLQ | `InboxDeduplicatesMessages`, `TestDuplicateMessagesMoveMoneyOnce`, `TestPoisonMessageEndsInDLQ` |
 | Reinício (lease expirado, outro publicador assume) | `OutboxLeaseTakeover`, `OutboxRetriesAfterPublishFailure` |
+| Composição Fx, partida, desligamento (porta fechada, consumidor parado) e retomada do trabalho em nova partida, com PostgreSQL, LocalStack e Keycloak reais | `TestAppLifecycleWithRealInfrastructure` |
 | Proteções do banco (ledger/outbox imutáveis, saldo ≥ 0) | `TestDatabaseGuards` |
 | Autenticação e papéis com o **Keycloak real** (sem token, adulterado, papel errado) | `TestKeycloakAuthentication` |
 | Isolamento entre provedores (leitura, replay, `providerId` forjado) | `TestKeycloakAuthentication`, `TestProviderIsolation` |

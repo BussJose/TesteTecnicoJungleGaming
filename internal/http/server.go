@@ -19,6 +19,7 @@ type apiMetrics struct {
 	duration     *metrics.HistogramVec
 	transactions *metrics.CounterVec
 	divergences  *metrics.CounterVec
+	replays      *metrics.CounterVec
 }
 
 // API reúne as dependências dos handlers.
@@ -41,6 +42,7 @@ func NewAPI(svc *wagering.Service, verifier auth.TokenVerifier, log *slog.Logger
 			duration: reg.Histogram("http_request_duration_seconds", "Duração das requisições HTTP.",
 				[]float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5}, "method", "route"),
 			transactions: reg.Counter("wager_transactions_total", "Operações de aposta processadas.", "kind", "status"),
+			replays:      reg.Counter("idempotent_replays_total", "Requisições repetidas respondidas pelo resultado original.", "kind"),
 			divergences:  reg.Counter("reconciliation_divergences_total", "Conciliações que encontraram divergência entre saldo e ledger."),
 		},
 	}

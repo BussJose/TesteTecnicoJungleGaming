@@ -50,6 +50,7 @@ type Service struct {
 	cfg        Config
 	now        func() time.Time
 	instanceID string
+	onConflict func(reason string) // observador de conflitos de concorrência (métricas)
 }
 
 // Option personaliza o Service.
@@ -60,6 +61,10 @@ func WithClock(now func() time.Time) Option { return func(s *Service) { s.now = 
 
 // WithInstanceID identifica a instância nos leases do worker.
 func WithInstanceID(v string) Option { return func(s *Service) { s.instanceID = v } }
+
+// WithConflictObserver registra uma função chamada a cada conflito temporário
+// que provoca uma nova tentativa (reason: "unique", "version" ou "transient").
+func WithConflictObserver(f func(reason string)) Option { return func(s *Service) { s.onConflict = f } }
 
 // NewService cria o serviço.
 func NewService(uow UnitOfWork, cfg Config, opts ...Option) *Service {
@@ -81,8 +86,19 @@ func (s *Service) retry(ctx context.Context, fn func(ctx context.Context, r Repo
 		if err == nil || ctx.Err() != nil {
 			return err
 		}
-		if !errors.Is(err, ErrUniqueViolation) && !errors.Is(err, ErrTransient) && !errors.Is(err, ErrConcurrentUpdate) {
+		reason := ""
+		switch {
+		case errors.Is(err, ErrUniqueViolation):
+			reason = "unique"
+		case errors.Is(err, ErrConcurrentUpdate):
+			reason = "version"
+		case errors.Is(err, ErrTransient):
+			reason = "transient"
+		default:
 			return err
+		}
+		if s.onConflict != nil {
+			s.onConflict(reason)
 		}
 	}
 	return err
