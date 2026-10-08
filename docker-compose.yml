@@ -1,3 +1,12 @@
+# Ambiente completo: PostgreSQL, Keycloak (identidade), LocalStack (SQS) e a API.
+#
+#   docker compose up --build                 sobe tudo (migrações incluídas)
+#   docker compose up -d postgres             sobe só o banco (para rodar os testes no seu computador)
+#   docker compose up --build --scale api=3   sobe 3 instâncias independentes da API
+#   docker compose run --rm migrate down 1    desfaz a última migração
+#   docker compose down -v                    apaga tudo, inclusive o banco
+name: wager
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -8,59 +17,97 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U wager -d wager"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # Aplica as migrações de ./migrations e termina. Reverter: run --rm migrate down 1
+  migrate:
+    image: migrate/migrate:v4.18.1
+    volumes:
+      - ./migrations:/migrations:ro
+    command: ["-path=/migrations", "-database=postgres://wager:wager@postgres:5432/wager?sslmode=disable", "up"]
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   keycloak:
     image: quay.io/keycloak/keycloak:26.0
-    command: start-dev --http-port=8080
+    command: ["start-dev", "--import-realm"]
     environment:
-      KC_BOOTSTRAP_ADMIN_USERNAME: admin
-      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_HEALTH_ENABLED: "true"
     ports:
       - "8081:8080"
+    volumes:
+      - ./keycloak/realm-wager.json:/opt/keycloak/data/import/realm-wager.json:ro
     healthcheck:
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '200'"]
-      interval: 10s
+      # a imagem não tem curl: abre uma conexão TCP na porta de gerenciamento (9000)
+      test:
+        - CMD-SHELL
+        - |
+          exec 3<>/dev/tcp/127.0.0.1/9000 &&
+          printf 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 &&
+          grep -q '"status": "UP"' <&3
+      interval: 5s
       timeout: 5s
-      retries: 12
-      start_period: 60s
+      retries: 40
+      start_period: 20s
 
   localstack:
     image: localstack/localstack:4.0
-    ports:
-      - "4566:4566"
     environment:
       SERVICES: sqs
-      DEBUG: "0"
+    ports:
+      - "4566:4566"
     volumes:
-      - ./scripts/localstack:/etc/localstack/init/ready.d
+      - ./scripts/localstack:/etc/localstack/init/ready.d:ro
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health | grep -q '\"sqs\": \"running\"'"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
 
   api:
     build: .
-    profiles: ["app"]
-    env_file:
-      - .env.example
+    env_file: .env.example
     environment:
+      # Dentro da rede do Docker os serviços se chamam pelo nome.
       DATABASE_URL: postgres://wager:wager@postgres:5432/wager?sslmode=disable
       AWS_ENDPOINT_URL: http://localstack:4566
-      SQS_WAGER_QUEUE_URL: http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/wager-transactions.fifo
+      SQS_WAGER_QUEUE_URL: http://localstack:4566/000000000000/wager-transactions.fifo
+      KEYCLOAK_URL: http://keycloak:8080                       # de onde buscar as chaves (JWKS)
+      KEYCLOAK_ISSUER: http://localhost:8081/realms/wager      # "iss" dos tokens pedidos pelo host
     ports:
-      - "8080:8080"
+      - "8080-8089:8080"      # permite --scale api=3 sem conflito de porta
     depends_on:
-      postgres:
+      migrate:
+        condition: service_completed_successfully
+      keycloak:
         condition: service_healthy
       localstack:
         condition: service_healthy
 
+  # Roda a suíte completa (com -race) dentro do Docker: go test -race ./...
+  test:
+    image: golang:1.27
+    profiles: ["tools"]
+    working_dir: /src
+    volumes:
+      - .:/src
+      - gomod:/go/pkg/mod
+    environment:
+      DATABASE_URL: postgres://wager:wager@postgres:5432/wager?sslmode=disable
+      CGO_ENABLED: "1"
+    command: ["go", "test", "-race", "-tags", "integration", "-count=1", "./..."]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 volumes:
-  postgres_data:
+  pgdata:
+  gomod:

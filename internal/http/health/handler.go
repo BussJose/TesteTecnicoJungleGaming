@@ -1,72 +1,82 @@
+// Package health implementa /health/live (o processo está de pé) e
+// /health/ready (as dependências respondem).
 package health
 
 import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"sort"
 	"sync"
+	"time"
 )
 
-type PostgresReady interface {
-	Ready(context.Context) error
+// Check verifica uma dependência.
+type Check struct {
+	Name string
+	Fn   func(ctx context.Context) error
 }
 
-type SQSReady interface {
-	Ready(context.Context) error
-}
-
+// Handler responde aos endpoints de saúde.
 type Handler struct {
-	pg  PostgresReady
-	sqs SQSReady
+	checks  []Check
+	timeout time.Duration
 }
 
-func NewHandler(pg PostgresReady, sqs SQSReady) *Handler {
-	return &Handler{pg: pg, sqs: sqs}
+// NewHandler cria o handler com as verificações de prontidão.
+func NewHandler(checks ...Check) *Handler {
+	return &Handler{checks: checks, timeout: 2 * time.Second}
 }
 
+// Live responde 200 enquanto o processo estiver rodando.
 func (h *Handler) Live(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"status":"up"}`))
 }
 
+// Ready roda as verificações em paralelo; responde 503 se alguma falhar.
 func (h *Handler) Ready(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	checks := map[string]string{}
-	status := http.StatusOK
+	ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
+	defer cancel()
 
+	results := make(map[string]string, len(h.checks))
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	run := func(name string, fn func(context.Context) error) {
+	ok := true
+	for _, c := range h.checks {
 		wg.Add(1)
-		go func() {
+		go func(c Check) {
 			defer wg.Done()
-			err := fn(ctx)
-			mu.Lock()
-			defer mu.Unlock()
-			if err != nil {
-				checks[name] = err.Error()
-				status = http.StatusServiceUnavailable
-				return
+			status := "up"
+			if err := c.Fn(ctx); err != nil {
+				status = "down"
 			}
-			checks[name] = "ok"
-		}()
+			mu.Lock()
+			results[c.Name] = status
+			if status == "down" {
+				ok = false
+			}
+			mu.Unlock()
+		}(c)
 	}
-
-	run("postgres", h.pg.Ready)
-	run("sqs", h.sqs.Ready)
 	wg.Wait()
 
-	body := map[string]any{
-		"status": "ready",
-		"checks": checks,
+	names := make([]string, 0, len(results))
+	for n := range results {
+		names = append(names, n)
 	}
-	if status != http.StatusOK {
-		body["status"] = "not_ready"
+	sort.Strings(names)
+	checks := make(map[string]string, len(names))
+	for _, n := range names {
+		checks[n] = results[n]
 	}
-	writeJSON(w, status, body)
-}
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
+	body := map[string]any{"status": "up", "checks": checks}
+	code := http.StatusOK
+	if !ok {
+		body["status"] = "down"
+		code = http.StatusServiceUnavailable
+	}
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(body)
 }

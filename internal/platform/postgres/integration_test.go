@@ -6,16 +6,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/monii/backend-challenge-go/internal/application/wagering"
 	"github.com/monii/backend-challenge-go/internal/application/wagering/wageringtest"
 	"github.com/monii/backend-challenge-go/internal/domain/id"
 	"github.com/monii/backend-challenge-go/internal/platform/postgres"
+	"github.com/monii/backend-challenge-go/internal/platform/postgres/pgtest"
 )
 
 // Estes testes usam um PostgreSQL REAL (sem mocks). Cada cenário roda num
@@ -24,19 +25,10 @@ import (
 //	DATABASE_URL=postgres://wager:wager@localhost:5432/wager?sslmode=disable \
 //	    go test -race -tags integration ./internal/platform/postgres/...
 
-func adminURL(t *testing.T) string {
+func newEnv(t *testing.T) (*wageringtest.Env, *pgxpool.Pool) {
 	t.Helper()
-	u := os.Getenv("DATABASE_URL")
-	if u == "" {
-		t.Skip("DATABASE_URL não definida: teste de integração ignorado")
-	}
-	return u
-}
-
-func newEnv(t *testing.T) (*wageringtest.Env, *testPool) {
-	t.Helper()
-	pool := newIsolatedPool(t, adminURL(t))
-	store := postgres.NewStore(pool.Pool)
+	pool := pgtest.NewDatabase(t)
+	store := postgres.NewStore(pool)
 	clock := wageringtest.NewFakeClock(time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC))
 	n := 0
 	return &wageringtest.Env{
@@ -51,7 +43,6 @@ func newEnv(t *testing.T) (*wageringtest.Env, *testPool) {
 }
 
 func TestSuiteOnPostgres(t *testing.T) {
-	adminURL(t)
 	wageringtest.RunSuite(t, func(t *testing.T) *wageringtest.Env {
 		env, _ := newEnv(t)
 		return env

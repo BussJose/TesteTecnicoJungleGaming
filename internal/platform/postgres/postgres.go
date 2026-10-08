@@ -1,44 +1,36 @@
+// Package postgres contém a conexão com o PostgreSQL e o Store que implementa
+// as portas da aplicação com SQL explícito (pgx).
 package postgres
 
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-type Pool struct {
-	*pgxpool.Pool
-}
+// Pool é o pool de conexões.
+type Pool struct{ *pgxpool.Pool }
 
-func NewPool(ctx context.Context, databaseURL string) (*Pool, error) {
+// NewPool abre o pool e confirma que o banco responde.
+func NewPool(ctx context.Context, databaseURL string, maxConns int) (*Pool, error) {
 	cfg, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
-		return nil, fmt.Errorf("parse database url: %w", err)
+		return nil, fmt.Errorf("DATABASE_URL inválida: %w", err)
 	}
-	cfg.MaxConns = 10
-
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if maxConns > 0 {
+		cfg.MaxConns = int32(maxConns)
+	}
+	p, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("connect postgres: %w", err)
+		return nil, fmt.Errorf("abrir pool postgres: %w", err)
 	}
-
-	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	if err := pool.Ping(pingCtx); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("ping postgres: %w", err)
+	if err := p.Ping(ctx); err != nil {
+		p.Close()
+		return nil, fmt.Errorf("postgres não responde: %w", err)
 	}
-
-	return &Pool{Pool: pool}, nil
+	return &Pool{p}, nil
 }
 
-func (p *Pool) Ready(ctx context.Context) error {
-	if p == nil || p.Pool == nil {
-		return fmt.Errorf("postgres pool not initialized")
-	}
-	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	return p.Ping(pingCtx)
-}
+// Ready verifica a conexão (usado em /health/ready).
+func (p *Pool) Ready(ctx context.Context) error { return p.Ping(ctx) }

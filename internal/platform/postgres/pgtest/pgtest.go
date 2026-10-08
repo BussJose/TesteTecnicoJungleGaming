@@ -1,6 +1,6 @@
-//go:build integration
-
-package postgres_test
+// Package pgtest cria bancos PostgreSQL descartáveis para testes de
+// integração (PostgreSQL de verdade, sem mocks).
+package pgtest
 
 import (
 	"context"
@@ -9,18 +9,22 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-type testPool struct{ *pgxpool.Pool }
-
-// newIsolatedPool cria um banco novo, aplica as migrations (*.up.sql, em
-// ordem) e o apaga no fim do teste.
-func newIsolatedPool(t *testing.T, admin string) *testPool {
+// NewDatabase cria um banco novo no servidor indicado por DATABASE_URL,
+// aplica as migrations (*.up.sql, em ordem) e o apaga no fim do teste.
+// Se DATABASE_URL não estiver definida, o teste é ignorado.
+func NewDatabase(t testing.TB) *pgxpool.Pool {
 	t.Helper()
+	admin := os.Getenv("DATABASE_URL")
+	if admin == "" {
+		t.Skip("DATABASE_URL não definida: teste de integração ignorado")
+	}
 	ctx := context.Background()
 	var b [6]byte
 	_, _ = rand.Read(b[:])
@@ -54,7 +58,8 @@ func newIsolatedPool(t *testing.T, admin string) *testPool {
 	}
 	t.Cleanup(pool.Close)
 
-	files, err := filepath.Glob("../../../migrations/*.up.sql")
+	_, here, _, _ := runtime.Caller(0)
+	files, err := filepath.Glob(filepath.Join(filepath.Dir(here), "../../../../migrations/*.up.sql"))
 	if err != nil || len(files) == 0 {
 		t.Fatalf("migrations not found: %v", err)
 	}
@@ -68,5 +73,5 @@ func newIsolatedPool(t *testing.T, admin string) *testPool {
 			t.Fatalf("apply %s: %v", f, err)
 		}
 	}
-	return &testPool{pool}
+	return pool
 }

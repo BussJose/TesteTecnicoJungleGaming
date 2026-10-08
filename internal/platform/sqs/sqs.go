@@ -1,74 +1,45 @@
+// Package sqs encapsula o cliente AWS SQS (LocalStack em desenvolvimento).
 package sqs
 
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/sqs"
-	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	awssqs "github.com/aws/aws-sdk-go-v2/service/sqs"
 )
 
-type Client struct {
-	client   *sqs.Client
-	queueURL string
-}
-
+// Options configura o cliente. As credenciais vêm das variáveis padrão da
+// AWS (AWS_ACCESS_KEY_ID e AWS_SECRET_ACCESS_KEY).
 type Options struct {
-	Region       string
-	EndpointURL  string
-	QueueURL     string
-	StaticKey    string
-	StaticSecret string
+	Region   string
+	Endpoint string // vazio = AWS real; http://localhost:4566 = LocalStack
+	QueueURL string
 }
 
-func New(ctx context.Context, opts Options) (*Client, error) {
-	if opts.Region == "" {
-		opts.Region = "us-east-1"
-	}
-	if opts.QueueURL == "" {
-		return nil, fmt.Errorf("SQS queue URL is required for readiness checks")
-	}
+// Client é o cliente SQS ligado à fila principal.
+type Client struct {
+	API      *awssqs.Client
+	QueueURL string
+}
 
-	loadOpts := []func(*config.LoadOptions) error{
-		config.WithRegion(opts.Region),
-	}
-	if opts.EndpointURL != "" {
-		loadOpts = append(loadOpts, config.WithBaseEndpoint(opts.EndpointURL))
-	}
-	if opts.StaticKey != "" && opts.StaticSecret != "" {
-		loadOpts = append(loadOpts, config.WithCredentialsProvider(
-			credentials.NewStaticCredentialsProvider(opts.StaticKey, opts.StaticSecret, ""),
-		))
-	}
-
-	awsCfg, err := config.LoadDefaultConfig(ctx, loadOpts...)
+// NewClient cria o cliente.
+func NewClient(ctx context.Context, o Options) (*Client, error) {
+	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(o.Region))
 	if err != nil {
-		return nil, fmt.Errorf("load aws config: %w", err)
+		return nil, fmt.Errorf("carregar configuração AWS: %w", err)
 	}
-
-	return &Client{
-		client:   sqs.NewFromConfig(awsCfg),
-		queueURL: opts.QueueURL,
-	}, nil
-}
-
-func (c *Client) Ready(ctx context.Context) error {
-	if c == nil || c.client == nil {
-		return fmt.Errorf("sqs client not initialized")
-	}
-	checkCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-
-	_, err := c.client.GetQueueAttributes(checkCtx, &sqs.GetQueueAttributesInput{
-		QueueUrl:       aws.String(c.queueURL),
-		AttributeNames: []types.QueueAttributeName{types.QueueAttributeNameQueueArn},
+	api := awssqs.NewFromConfig(cfg, func(so *awssqs.Options) {
+		if o.Endpoint != "" {
+			so.BaseEndpoint = aws.String(o.Endpoint)
+		}
 	})
-	if err != nil {
-		return fmt.Errorf("sqs get queue attributes: %w", err)
-	}
-	return nil
+	return &Client{API: api, QueueURL: o.QueueURL}, nil
+}
+
+// Ready confirma que a fila existe e responde (usado em /health/ready).
+func (c *Client) Ready(ctx context.Context) error {
+	_, err := c.API.GetQueueAttributes(ctx, &awssqs.GetQueueAttributesInput{QueueUrl: aws.String(c.QueueURL)})
+	return err
 }
