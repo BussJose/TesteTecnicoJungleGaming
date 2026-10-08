@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,12 +19,13 @@ import (
 // fakeQueue imita o comportamento do SQS que importa aqui: visibilidade,
 // contagem de recebimentos e redrive para a DLQ.
 type fakeQueue struct {
-	mu         sync.Mutex
-	msgs       []*fqMsg
-	dlq        []string
-	maxReceive int
-	failDelete int
-	seq        int
+	mu             sync.Mutex
+	msgs           []*fqMsg
+	dlq            []string
+	maxReceive     int
+	failDelete     int
+	lastVisibility time.Duration
+	seq            int
 }
 
 type fqMsg struct {
@@ -83,11 +85,14 @@ func (q *fakeQueue) Delete(_ context.Context, receipt string) error {
 	return nil
 }
 
-func (q *fakeQueue) Release(_ context.Context, receipt string) error {
+// Release com visibilidade 0 devolve a mensagem à fila; com valor positivo ela
+// continua invisível até ExpireVisibility (o backoff é simulado pelo teste).
+func (q *fakeQueue) Release(_ context.Context, receipt string, visibility time.Duration) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	q.lastVisibility = visibility
 	for _, m := range q.msgs {
-		if m.receipt == receipt {
+		if m.receipt == receipt && visibility == 0 {
 			m.inflight = false
 		}
 	}
@@ -129,9 +134,14 @@ func newRig(t *testing.T) *rig {
 		wallet: w.ID(), player: w.PlayerID()}
 }
 
+// body monta o envelope WagerTransactionRequested.
 func (r *rig) body(ext, kind, amount string) string {
-	return fmt.Sprintf(`{"idempotencyKey":"k-%s","providerId":"prov","externalTransactionId":"%s","playerId":"%s","walletId":"%s","roundId":"r1","gameId":"g1","kind":"%s","money":{"amount":"%s","currency":"BRL"}}`,
-		ext, ext, r.player, r.wallet, kind, amount)
+	return r.bodyWithID("msg-"+ext, ext, kind, amount)
+}
+
+func (r *rig) bodyWithID(msgID, ext, kind, amount string) string {
+	return fmt.Sprintf(`{"messageId":"%s","type":"WagerTransactionRequested","occurredAt":"2026-10-08T12:00:00Z","data":{"idempotencyKey":"k-%s","providerId":"prov","externalTransactionId":"%s","playerId":"%s","walletId":"%s","roundId":"r1","gameId":"g1","kind":"%s","money":{"amount":"%s","currency":"BRL"}}}`,
+		msgID, ext, ext, r.player, r.wallet, kind, amount)
 }
 
 // drain recebe e trata mensagens até a fila esvaziar ou n rodadas.
@@ -228,5 +238,73 @@ func TestConcurrentConsumers(t *testing.T) {
 	wg.Wait()
 	if got := r.balance(); got != "80.00" {
 		t.Fatalf("balance = %s, want 80.00", got)
+	}
+}
+
+func TestEnvelopeValidation(t *testing.T) {
+	r := newRig(t)
+	good := r.body("x", "BET", "1.00")
+	if _, _, err := messaging.Parse(good); err != nil {
+		t.Fatal(err)
+	}
+	bad := map[string]string{
+		"wrong type":          strings.Replace(good, "WagerTransactionRequested", "Other", 1),
+		"missing messageId":   strings.Replace(good, `"messageId":"msg-x"`, `"messageId":""`, 1),
+		"missing occurredAt":  strings.Replace(good, `"occurredAt":"2026-10-08T12:00:00Z",`, "", 1),
+		"bad occurredAt":      strings.Replace(good, "2026-10-08T12:00:00Z", "ontem", 1),
+		"flat legacy body":    `{"idempotencyKey":"k","providerId":"p"}`,
+		"unknown in data":     strings.Replace(good, `"roundId"`, `"extra":1,"roundId"`, 1),
+		"not json":            `hello`,
+		"trailing data":       good + `{}`,
+		"missing idempotency": strings.Replace(good, `"idempotencyKey":"k-x"`, `"idempotencyKey":""`, 1),
+	}
+	for name, body := range bad {
+		if _, _, err := messaging.Parse(body); !errors.Is(err, wagering.ErrInvalidInput) {
+			t.Errorf("%s: err = %v", name, err)
+		}
+	}
+}
+
+// Mesmo messageId do envelope chegando de novo (com outro MessageId do SQS):
+// a inbox reconhece. Com conteúdo diferente, vira veneno.
+func TestEnvelopeMessageIdentity(t *testing.T) {
+	r := newRig(t)
+	ctx := context.Background()
+	handle := func(body string) (messaging.Result, error) {
+		id := r.q.Send(body)
+		msgs, _ := r.q.Receive(ctx, 10, 0)
+		for _, m := range msgs {
+			if m.ID == id {
+				return r.c.Handle(ctx, m)
+			}
+		}
+		t.Fatal("message not received")
+		return "", nil
+	}
+	if res, err := handle(r.bodyWithID("same", "b1", "BET", "10.00")); err != nil || res != messaging.ResultProcessed {
+		t.Fatalf("first: %s %v", res, err)
+	}
+	if res, err := handle(r.bodyWithID("same", "b1", "BET", "10.00")); err != nil || res != messaging.ResultDuplicate {
+		t.Fatalf("same messageId, same body: %s %v", res, err)
+	}
+	if res, err := handle(r.bodyWithID("same", "b9", "BET", "99.00")); res != messaging.ResultPoison || !errors.Is(err, wagering.ErrInboxConflict) {
+		t.Fatalf("same messageId, other body: %s %v", res, err)
+	}
+	if r.balance() != "90.00" {
+		t.Fatalf("balance = %s", r.balance())
+	}
+}
+
+// Falha temporária: a mensagem não é apagada e a visibilidade cresce (backoff).
+func TestTransientFailureBacksOff(t *testing.T) {
+	r := newRig(t)
+	r.wallet = id.New() // carteira que ainda não existe
+	r.q.Send(r.body("b1", "BET", "1.00"))
+	msgs, _ := r.q.Receive(context.Background(), 10, 0)
+	if res, err := r.c.Handle(context.Background(), msgs[0]); res != messaging.ResultRetry || err == nil {
+		t.Fatalf("got %s %v", res, err)
+	}
+	if r.q.lastVisibility < 2*time.Second || r.q.Len() != 1 {
+		t.Fatalf("visibility=%v queue=%d", r.q.lastVisibility, r.q.Len())
 	}
 }

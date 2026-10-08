@@ -104,11 +104,12 @@ func (q *Queue) Delete(ctx context.Context, receiptHandle string) error {
 	return err
 }
 
-// Release torna a mensagem visível de novo agora. Quando o número de
+// Release muda a visibilidade (0 = visível agora; >0 = backoff). Quando o número de
 // recebimentos passa de maxReceiveCount, a própria fila a move para a DLQ.
-func (q *Queue) Release(ctx context.Context, receiptHandle string) error {
+func (q *Queue) Release(ctx context.Context, receiptHandle string, visibility time.Duration) error {
 	_, err := q.api.ChangeMessageVisibility(ctx, &awssqs.ChangeMessageVisibilityInput{
-		QueueUrl: aws.String(q.url), ReceiptHandle: aws.String(receiptHandle), VisibilityTimeout: 0,
+		QueueUrl: aws.String(q.url), ReceiptHandle: aws.String(receiptHandle),
+		VisibilityTimeout: int32(visibility / time.Second),
 	})
 	return err
 }

@@ -95,6 +95,7 @@ type Reconciliation struct {
 	WalletID      id.ID
 	WalletBalance money.Money
 	LedgerBalance money.Money
+	Difference    money.Money // saldo armazenado menos saldo reconstruído
 	WalletVersion int64
 	Entries       int64
 	Consistent    bool
@@ -110,8 +111,9 @@ func (s *Service) Reconcile(ctx context.Context, walletID id.ID) (*Reconciliatio
 			return err
 		}
 		c, err := sum.WalletBalance.Cmp(sum.LedgerBalance)
+		diff, _ := sum.WalletBalance.Sub(sum.LedgerBalance)
 		out = &Reconciliation{
-			WalletID: walletID, WalletBalance: sum.WalletBalance, LedgerBalance: sum.LedgerBalance,
+			WalletID: walletID, WalletBalance: sum.WalletBalance, LedgerBalance: sum.LedgerBalance, Difference: diff,
 			WalletVersion: sum.WalletVersion, Entries: sum.Entries, Consistent: err == nil && c == 0,
 		}
 		return nil

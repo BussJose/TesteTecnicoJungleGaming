@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
@@ -131,12 +132,13 @@ func (a *API) listLedger(w http.ResponseWriter, r *http.Request) {
 }
 
 type reconciliationDTO struct {
-	WalletID      id.ID       `json:"walletId"`
-	WalletBalance money.Money `json:"walletBalance"`
-	LedgerBalance money.Money `json:"ledgerBalance"`
-	WalletVersion int64       `json:"walletVersion"`
-	LedgerEntries int64       `json:"ledgerEntries"`
-	Consistent    bool        `json:"consistent"`
+	WalletID          id.ID       `json:"walletId"`
+	StoredBalance     money.Money `json:"storedBalance"`
+	CalculatedBalance money.Money `json:"calculatedBalance"`
+	Difference        money.Money `json:"difference"` // armazenado menos reconstruído
+	Consistent        bool        `json:"consistent"`
+	CheckedEntries    int64       `json:"checkedEntries"`
+	WalletVersion     int64       `json:"walletVersion"`
 }
 
 func (a *API) reconcile(w http.ResponseWriter, r *http.Request) {
@@ -150,13 +152,23 @@ func (a *API) reconcile(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, reconciliationDTO{rec.WalletID, rec.WalletBalance, rec.LedgerBalance,
-		rec.WalletVersion, rec.Entries, rec.Consistent})
+	if !rec.Consistent {
+		a.m.divergences.Inc()
+		a.log.Error("reconciliation divergence", slog.String("walletId", walletID.String()),
+			slog.String("stored", rec.WalletBalance.Amount()), slog.String("calculated", rec.LedgerBalance.Amount()),
+			slog.String("difference", rec.Difference.Amount()))
+	}
+	writeJSON(w, http.StatusOK, reconciliationDTO{
+		WalletID: rec.WalletID, StoredBalance: rec.WalletBalance, CalculatedBalance: rec.LedgerBalance,
+		Difference: rec.Difference, Consistent: rec.Consistent, CheckedEntries: rec.Entries,
+		WalletVersion: rec.WalletVersion})
 }
 
 // ----------------------------------------------------- operações de aposta
 
 type submitRequest struct {
+	// ProviderID é opcional: a identidade vem do token; se informado, deve ser o mesmo.
+	ProviderID                     string      `json:"providerId"`
 	ExternalTransactionID          string      `json:"externalTransactionId"`
 	PlayerID                       id.ID       `json:"playerId"`
 	WalletID                       id.ID       `json:"walletId"`
@@ -220,6 +232,10 @@ func (a *API) submit(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, r, err)
 		return
 	}
+	if req.ProviderID != "" && req.ProviderID != ident.ProviderID {
+		writeProblem(w, r, http.StatusForbidden, "PROVIDER_MISMATCH", "providerId does not match the authenticated provider")
+		return
+	}
 	out, err := a.svc.Submit(r.Context(), wagering.SubmitCommand{
 		ProviderID:            ident.ProviderID, // vem do token, nunca do corpo
 		ExternalTransactionID: req.ExternalTransactionID, IdempotencyKey: key,
@@ -241,10 +257,35 @@ func (a *API) submit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, statusFor(t.Status()), d)
 }
 
+// getTransaction lê por id interno. Transações de outro provedor (ou internas,
+// como OPENING) respondem 404, igual a uma transação inexistente.
 func (a *API) getTransaction(w http.ResponseWriter, r *http.Request) {
 	ident := identityFrom(r.Context())
-	// A busca é sempre dentro do provedor autenticado: um provedor nunca
-	// enxerga transações de outro.
+	txID, err := pathID(r, "transactionId")
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	t, err := a.svc.GetTransaction(r.Context(), txID)
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	if t.ProviderID() != ident.ProviderID {
+		a.fail(w, r, wagering.ErrNotFound)
+		return
+	}
+	writeJSON(w, http.StatusOK, toTransactionDTO(t))
+}
+
+// getProviderTransaction lê por (provedor, id externo). O provedor do caminho
+// precisa ser o do token; a busca é sempre dentro dele.
+func (a *API) getProviderTransaction(w http.ResponseWriter, r *http.Request) {
+	ident := identityFrom(r.Context())
+	if r.PathValue("providerId") != ident.ProviderID {
+		writeProblem(w, r, http.StatusForbidden, "FORBIDDEN", "the client is not allowed to read this provider")
+		return
+	}
 	t, err := a.svc.FindTransaction(r.Context(), ident.ProviderID, r.PathValue("externalId"))
 	if err != nil {
 		a.fail(w, r, err)

@@ -213,6 +213,7 @@ func RunSuite(t *testing.T, newEnv func(t *testing.T) *Env) {
 		{"TwoConcurrentPendingResolvers", testConcurrentResolvers},
 		{"InboxDeduplicatesMessages", testInbox},
 		{"InboxIsAtomicWithBusiness", testInboxAtomic},
+		{"SameOperationOverHTTPAndSQS", testCrossChannel},
 		{"OutboxPublishesOnceInOrderWithTwoPublishers", testOutboxTwoPublishers},
 		{"OutboxRetriesAfterPublishFailure", testOutboxRetry},
 		{"OutboxLeaseTakeover", testOutboxLease},

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -249,4 +250,57 @@ func testOutboxLease(t *testing.T, newEnv func(*testing.T) *Env) {
 	if got := pub.Published(); len(got) != total || x.pending() != 0 {
 		t.Fatalf("takeover: published %d of %d (pending %d) %s", len(got), total, x.pending(), fmt.Sprint(recs[0].EventID))
 	}
+}
+
+// A mesma operação chegando pelos dois canais (HTTP e SQS), em qualquer ordem
+// e em paralelo, move o dinheiro uma única vez: o hash e a idempotência são
+// os mesmos para os dois.
+func testCrossChannel(t *testing.T, newEnv func(*testing.T) *Env) {
+	x := newH(t, newEnv, "100.00")
+	c := x.cmd("BET", "10.00", "")
+
+	if o := x.submit(c); o.IdempotentReplay {
+		t.Fatal("first call must not be a replay")
+	}
+	o, err := x.message("q", "msg-1", "h1", c) // SQS depois do HTTP
+	if err != nil || !o.IdempotentReplay || o.Transaction.Status() != wager.StatusProcessed {
+		t.Fatalf("sqs after http: %+v %v", o, err)
+	}
+	x.balance("90.00", 2)
+
+	// SQS primeiro, HTTP depois
+	c2 := x.cmd("BET", "5.00", "")
+	if o, err := x.message("q", "msg-2", "h2", c2); err != nil || o.IdempotentReplay {
+		t.Fatalf("sqs first: %+v %v", o, err)
+	}
+	if o := x.submit(c2); !o.IdempotentReplay {
+		t.Fatal("http after sqs must be a replay")
+	}
+	x.balance("85.00", 3)
+
+	// os dois canais ao mesmo tempo
+	c3 := x.cmd("BET", "7.00", "")
+	var fresh atomic.Int32
+	runParallel(20, func(i int) {
+		var o *wagering.Outcome
+		var err error
+		if i%2 == 0 {
+			o, err = x.env.NewService().Submit(x.ctx, c3)
+		} else {
+			o, err = x.env.NewService().SubmitMessage(x.ctx,
+				wagering.InboxMessage{Consumer: "q", MessageID: fmt.Sprintf("par-%d", i), PayloadHash: "h"}, c3)
+		}
+		if err != nil {
+			t.Errorf("parallel %d: %v", i, err)
+			return
+		}
+		if !o.IdempotentReplay {
+			fresh.Add(1)
+		}
+	})
+	if fresh.Load() != 1 {
+		t.Fatalf("operation applied %d times", fresh.Load())
+	}
+	x.balance("78.00", 4)
+	x.reconciled()
 }

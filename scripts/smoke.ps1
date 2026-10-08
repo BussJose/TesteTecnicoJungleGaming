@@ -54,7 +54,7 @@ Bet "refund-late" "REFUND" "10.00" "key-refund-late" "bet-3" | Out-Null
 Write-Host "`n== 7. A aposta chega (o worker conclui o estorno em ~1s) ==" -ForegroundColor Yellow
 Bet "bet-3" "BET" "10.00" "key-bet-3" | Out-Null
 Start-Sleep -Seconds 3
-Call "GET" "/wagering/transactions/refund-late" $provA | Out-Null
+Call "GET" "/providers/provider-a/wagering/transactions/refund-late" $provA | Out-Null
 Write-Host "`n== 8. Saldo, ledger e conciliação ==" -ForegroundColor Yellow
 Call "GET" "/wallets/$($w.id)" $internal | Out-Null
 Call "GET" "/wallets/$($w.id)/ledger" $internal | Out-Null

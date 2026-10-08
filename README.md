@@ -85,14 +85,22 @@ Criadas automaticamente pelo LocalStack ao ficar pronto, por
 
 Recriar manualmente (se precisar): `docker compose exec localstack /etc/localstack/init/ready.d/init-sqs.sh`.
 
-Enviar uma transação pela fila (a carteira precisa existir; veja o §6 para criá-la):
+Enviar uma transação pela fila (a carteira precisa existir; veja o §6 para criá-la). O corpo é o envelope
+`WagerTransactionRequested`; o `messageId` do envelope é a identidade da mensagem na inbox:
 
 ```bash
 docker compose exec localstack awslocal sqs send-message \
   --queue-url http://localhost:4566/000000000000/wager-transactions.fifo \
-  --message-group-id <WALLET_ID> --message-deduplication-id msg-1 \
-  --message-body '{"idempotencyKey":"k-1","providerId":"provider-a","externalTransactionId":"bet-q1","playerId":"<PLAYER_ID>","walletId":"<WALLET_ID>","roundId":"r1","gameId":"g1","kind":"BET","money":{"amount":"10.00","currency":"BRL"}}'
+  --message-group-id <WALLET_ID> --message-deduplication-id dedup-1 \
+  --message-body '{"messageId":"msg-q1","type":"WagerTransactionRequested","occurredAt":"2026-10-08T12:00:00Z","data":{"idempotencyKey":"k-q1","providerId":"provider-a","externalTransactionId":"bet-q1","playerId":"<PLAYER_ID>","walletId":"<WALLET_ID>","roundId":"r1","gameId":"g1","kind":"BET","money":{"amount":"10.00","currency":"BRL"}}}'
 ```
+
+Regras de consumo: sucesso, rejeição de negócio definitiva (`REJECTED`) e reentrega reconhecida pela inbox apagam a
+mensagem; mensagem inválida ou conflitante (mesmo `messageId` com conteúdo diferente) volta à fila na hora e, após 5
+recebimentos, a própria fila a move para a DLQ; falha temporária (banco fora do ar, carteira ainda inexistente) mantém a
+mensagem invisível por 2 s, 4 s, 8 s… (até 60 s) e, esgotadas as 5 tentativas, ela também vai para a DLQ.
+`MessageGroupId` = id da carteira (operações da mesma carteira em ordem) e `MessageDeduplicationId` = o que o produtor
+definir (a fila descarta repetições por 5 minutos; a inbox cobre o resto).
 
 Ver os eventos publicados:
 
@@ -160,7 +168,8 @@ curl -s -X POST $API/wagering/transactions -H "Authorization: Bearer $PROVIDER" 
   -d '{"externalTransactionId":"refund-1","playerId":"8d7b172a-dfdd-43c3-8bff-57cf3703e20b","walletId":"<WALLET_ID>","roundId":"r1","gameId":"g1","kind":"REFUND","referenceExternalTransactionId":"bet-2","money":{"amount":"10.00","currency":"BRL"}}'
 
 # 4) consultas e conciliação
-curl -s $API/wagering/transactions/bet-1  -H "Authorization: Bearer $PROVIDER"
+curl -s $API/providers/provider-a/wagering/transactions/bet-1 -H "Authorization: Bearer $PROVIDER"   # por id externo
+curl -s $API/wagering/transactions/<TRANSACTION_ID> -H "Authorization: Bearer $PROVIDER"            # por id interno
 curl -s $API/wallets/<WALLET_ID>          -H "Authorization: Bearer $INTERNAL"
 curl -s "$API/wallets/<WALLET_ID>/ledger?limit=50" -H "Authorization: Bearer $INTERNAL"
 curl -s -X POST $API/wallets/<WALLET_ID>/reconciliation -H "Authorization: Bearer $INTERNAL"
@@ -175,15 +184,16 @@ curl -s -X POST $API/wallets/<WALLET_ID>/reconciliation -H "Authorization: Beare
 | `POST /wallets` | `wallet-internal` | abre carteira (`playerId`, `initialBalance` em dinheiro) |
 | `GET /wallets/{id}` | `wallet-internal` | saldo e versão |
 | `GET /wallets/{id}/ledger` | `wallet-internal` | lançamentos (paginação por `cursor`) |
-| `POST /wallets/{id}/reconciliation` | `wallet-internal` | confere saldo × soma do ledger |
-| `POST /wagering/transactions` | `wager-provider` | processa uma operação (header `Idempotency-Key` obrigatório) |
-| `GET /wagering/transactions/{externalId}` | `wager-provider` | consulta |
+| `POST /wallets/{id}/reconciliation` | `wallet-internal` | reconstrói o saldo pelo ledger e compara: `storedBalance`, `calculatedBalance`, `difference` (armazenado − reconstruído), `consistent`, `checkedEntries`. Não altera saldos; divergência vai para o log e para a métrica `reconciliation_divergences_total` |
+| `POST /wagering/transactions` | `wager-provider` | processa uma operação (header `Idempotency-Key` obrigatório; `providerId` no corpo é opcional e, se vier, deve ser o do token) |
+| `GET /wagering/transactions/{transactionId}` | `wager-provider` | consulta por id interno (só do próprio provedor) |
+| `GET /providers/{providerId}/wagering/transactions/{externalId}` | `wager-provider` | consulta por id externo; `providerId` deve ser o do token (senão 403) |
 
 Valores monetários são sempre texto: `{"amount":"25.00","currency":"BRL"}`.
 
 Status HTTP: `200` processada · `202` aguardando a transação referenciada · `422` rejeitada
-(`INSUFFICIENT_FUNDS`, `REFERENCE_MISMATCH`, …) · `400` entrada inválida (não é gravada) ·
-`401`/`403` autenticação/permissão · `404` · `409` mesma chave com conteúdo diferente · `503` falha temporária.
+(`INSUFFICIENT_FUNDS`, `REFERENCE_MISMATCH`, …; o corpo traz `failureCode`) · `400` entrada inválida (não é gravada) ·
+`401` sem token ou token inválido/expirado · `403` papel insuficiente, `providerId` diferente do token ou provedor de outro caminho · `404` · `409` mesma chave com conteúdo diferente · `503` falha temporária.
 
 ## 7. Testes
 
@@ -199,22 +209,24 @@ Testes de **integração** (PostgreSQL e SQS reais, sem mocks) e `-race` — den
 docker compose run --rm test                 # go test -race -tags integration ./...
 ```
 
-Ou, no seu computador, com a infraestrutura de pé (`docker compose up -d postgres localstack`):
+Ou, no seu computador, com a infraestrutura de pé (`docker compose up -d postgres localstack keycloak`):
 
 ```bash
 # Linux/macOS
 DATABASE_URL='postgres://wager:wager@localhost:5432/wager?sslmode=disable' \
 AWS_ENDPOINT_URL=http://localhost:4566 AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
+KEYCLOAK_URL=http://localhost:8081 \
 go test -race -tags integration -count=1 ./...
 ```
 ```powershell
 # PowerShell (sem -race: exige cgo)
 $env:DATABASE_URL="postgres://wager:wager@localhost:5432/wager?sslmode=disable"
 $env:AWS_ENDPOINT_URL="http://localhost:4566"; $env:AWS_ACCESS_KEY_ID="test"; $env:AWS_SECRET_ACCESS_KEY="test"
+$env:KEYCLOAK_URL="http://localhost:8081"
 go test -tags integration -count=1 ./...
 ```
 
-Cada teste de integração cria o próprio banco temporário (e filas com nome único), aplica as migrations de
+Testes de integração sem as variáveis correspondentes (`DATABASE_URL`, `AWS_ENDPOINT_URL`, `KEYCLOAK_URL`) são ignorados (`SKIP`); o serviço `test` do compose define todas. Cada teste de integração cria o próprio banco temporário (e filas com nome único), aplica as migrations de
 `migrations/` e apaga tudo no fim.
 
 ### Onde está cada teste exigido
@@ -230,7 +242,9 @@ Cada teste de integração cria o próprio banco temporário (e filas com nome �
 | Mensagem duplicada / veneno → DLQ | `InboxDeduplicatesMessages`, `TestDuplicateMessagesMoveMoneyOnce`, `TestPoisonMessageEndsInDLQ` |
 | Reinício (lease expirado, outro publicador assume) | `OutboxLeaseTakeover`, `OutboxRetriesAfterPublishFailure` |
 | Proteções do banco (ledger/outbox imutáveis, saldo ≥ 0) | `TestDatabaseGuards` |
-| Autenticação e isolamento entre provedores | `TestAuthentication`, `TestProviderIsolation` |
+| Autenticação e papéis com o **Keycloak real** (sem token, adulterado, papel errado) | `TestKeycloakAuthentication` |
+| Isolamento entre provedores (leitura, replay, `providerId` forjado) | `TestKeycloakAuthentication`, `TestProviderIsolation` |
+| Mesma operação por HTTP e SQS, inclusive em paralelo | `SameOperationOverHTTPAndSQS` |
 
 As suítes `RunSuite` (pasta `internal/application/wagering/wageringtest`) rodam **as mesmas regras** em memória
 e no PostgreSQL real.

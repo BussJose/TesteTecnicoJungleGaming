@@ -108,11 +108,14 @@ services:
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
       AWS_ENDPOINT_URL: http://localstack:4566
+      KEYCLOAK_URL: http://keycloak:8080
     command: ["go", "test", "-race", "-tags", "integration", "-count=1", "./..."]
     depends_on:
       postgres:
         condition: service_healthy
       localstack:
+        condition: service_healthy
+      keycloak:
         condition: service_healthy
 
 volumes:

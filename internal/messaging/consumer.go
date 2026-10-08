@@ -40,9 +40,10 @@ type Queue interface {
 	Receive(ctx context.Context, max int, wait time.Duration) ([]Message, error)
 	// Delete apaga a mensagem (processada com sucesso).
 	Delete(ctx context.Context, receiptHandle string) error
-	// Release devolve a mensagem à fila imediatamente (visibilidade 0).
-	// Depois de maxReceiveCount recebimentos a fila a move para a DLQ.
-	Release(ctx context.Context, receiptHandle string) error
+	// Release muda a visibilidade da mensagem: 0 a devolve à fila agora; um
+	// valor positivo a mantém invisível por esse tempo (backoff). Depois de
+	// maxReceiveCount recebimentos a fila a move para a DLQ.
+	Release(ctx context.Context, receiptHandle string, visibility time.Duration) error
 }
 
 // Processor é o que o consumidor precisa do serviço de aplicação.
@@ -50,11 +51,27 @@ type Processor interface {
 	SubmitMessage(ctx context.Context, m wagering.InboxMessage, c wagering.SubmitCommand) (*wagering.Outcome, error)
 }
 
-// Payload é o corpo JSON esperado na fila. Campos desconhecidos são rejeitados.
-type Payload struct {
-	IdempotencyKey        string `json:"idempotencyKey"`
+// TypeRequested é o tipo do envelope aceito nesta fila.
+const TypeRequested = "WagerTransactionRequested"
+
+// Envelope é o corpo JSON esperado na fila de entrada:
+//
+//	{"messageId":"…","type":"WagerTransactionRequested","occurredAt":"2026-10-08T12:00:00Z","data":{…}}
+//
+// Campos desconhecidos são rejeitados. O messageId do envelope (e não o
+// MessageId do SQS) é a identidade durável da mensagem na inbox.
+type Envelope struct {
+	MessageID  string    `json:"messageId"`
+	Type       string    `json:"type"`
+	OccurredAt time.Time `json:"occurredAt"`
+	Data       Data      `json:"data"`
+}
+
+// Data é o conteúdo da transação solicitada.
+type Data struct {
 	ProviderID            string `json:"providerId"`
 	ExternalTransactionID string `json:"externalTransactionId"`
+	IdempotencyKey        string `json:"idempotencyKey"`
 	PlayerID              string `json:"playerId"`
 	WalletID              string `json:"walletId"`
 	RoundID               string `json:"roundId"`
@@ -67,34 +84,45 @@ type Payload struct {
 	ReferenceExternalTransactionID string `json:"referenceExternalTransactionId"`
 }
 
-// Command converte o corpo da mensagem em comando de aplicação.
-func Command(body string) (wagering.SubmitCommand, error) {
-	var p Payload
+// Parse valida o envelope e converte os dados em comando de aplicação.
+// Qualquer erro aqui é uma mensagem inválida (não adianta tentar de novo).
+func Parse(body string) (Envelope, wagering.SubmitCommand, error) {
+	var env Envelope
 	dec := json.NewDecoder(bytes.NewReader([]byte(body)))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&p); err != nil {
-		return wagering.SubmitCommand{}, fmt.Errorf("%w: body: %v", wagering.ErrInvalidInput, err)
+	if err := dec.Decode(&env); err != nil {
+		return env, wagering.SubmitCommand{}, fmt.Errorf("%w: body: %v", wagering.ErrInvalidInput, err)
 	}
 	if dec.More() {
-		return wagering.SubmitCommand{}, fmt.Errorf("%w: body has trailing data", wagering.ErrInvalidInput)
+		return env, wagering.SubmitCommand{}, fmt.Errorf("%w: body has trailing data", wagering.ErrInvalidInput)
 	}
-	if p.ProviderID == "" || p.IdempotencyKey == "" {
-		return wagering.SubmitCommand{}, fmt.Errorf("%w: providerId and idempotencyKey are required", wagering.ErrInvalidInput)
+	if env.MessageID == "" || len(env.MessageID) > 128 {
+		return env, wagering.SubmitCommand{}, fmt.Errorf("%w: messageId is required (max 128 chars)", wagering.ErrInvalidInput)
 	}
-	wid, err := id.Parse(p.WalletID)
+	if env.Type != TypeRequested {
+		return env, wagering.SubmitCommand{}, fmt.Errorf("%w: type must be %s", wagering.ErrInvalidInput, TypeRequested)
+	}
+	if env.OccurredAt.IsZero() {
+		return env, wagering.SubmitCommand{}, fmt.Errorf("%w: occurredAt is required (RFC 3339)", wagering.ErrInvalidInput)
+	}
+	d := env.Data
+	if d.ProviderID == "" || d.IdempotencyKey == "" {
+		return env, wagering.SubmitCommand{}, fmt.Errorf("%w: data.providerId and data.idempotencyKey are required", wagering.ErrInvalidInput)
+	}
+	wid, err := id.Parse(d.WalletID)
 	if err != nil {
-		return wagering.SubmitCommand{}, fmt.Errorf("%w: walletId: %v", wagering.ErrInvalidInput, err)
+		return env, wagering.SubmitCommand{}, fmt.Errorf("%w: data.walletId: %v", wagering.ErrInvalidInput, err)
 	}
-	pid, err := id.Parse(p.PlayerID)
+	pid, err := id.Parse(d.PlayerID)
 	if err != nil {
-		return wagering.SubmitCommand{}, fmt.Errorf("%w: playerId: %v", wagering.ErrInvalidInput, err)
+		return env, wagering.SubmitCommand{}, fmt.Errorf("%w: data.playerId: %v", wagering.ErrInvalidInput, err)
 	}
-	return wagering.SubmitCommand{
-		ProviderID: p.ProviderID, ExternalTransactionID: p.ExternalTransactionID,
-		IdempotencyKey: p.IdempotencyKey, WalletID: wid, PlayerID: pid,
-		RoundID: p.RoundID, GameID: p.GameID, Kind: p.Kind,
-		Amount: p.Money.Amount, Currency: p.Money.Currency,
-		ReferenceExternalTransactionID: p.ReferenceExternalTransactionID,
+	return env, wagering.SubmitCommand{
+		ProviderID: d.ProviderID, ExternalTransactionID: d.ExternalTransactionID,
+		IdempotencyKey: d.IdempotencyKey, WalletID: wid, PlayerID: pid,
+		RoundID: d.RoundID, GameID: d.GameID, Kind: d.Kind,
+		Amount: d.Money.Amount, Currency: d.Money.Currency,
+		ReferenceExternalTransactionID: d.ReferenceExternalTransactionID,
 	}, nil
 }
 
@@ -168,21 +196,45 @@ func (c *Consumer) Handle(ctx context.Context, m Message) (Result, error) {
 			return res, fmt.Errorf("delete message %s: %w", m.ID, derr)
 		}
 	case ResultPoison:
-		if rerr := c.queue.Release(context.WithoutCancel(ctx), m.ReceiptHandle); rerr != nil {
+		// Visibilidade 0: a fila reentrega logo e, ao atingir maxReceiveCount, a envia à DLQ.
+		if rerr := c.queue.Release(context.WithoutCancel(ctx), m.ReceiptHandle, 0); rerr != nil {
+			return res, errors.Join(err, fmt.Errorf("release message %s: %w", m.ID, rerr))
+		}
+	case ResultRetry:
+		// Falha temporária: espera crescente (2s, 4s, 8s… até 60s) antes da próxima entrega.
+		if rerr := c.queue.Release(context.WithoutCancel(ctx), m.ReceiptHandle, retryDelay(m.ReceiveCount)); rerr != nil {
 			return res, errors.Join(err, fmt.Errorf("release message %s: %w", m.ID, rerr))
 		}
 	}
 	return res, err
 }
 
+// retryDelay é o backoff exponencial entre entregas de uma mensagem que falhou
+// de forma temporária, limitado a 60s.
+func retryDelay(receiveCount int) time.Duration {
+	if receiveCount < 1 {
+		receiveCount = 1
+	}
+	if receiveCount > 6 {
+		receiveCount = 6
+	}
+	d := time.Second << uint(receiveCount) // 2s, 4s, 8s, 16s, 32s, 64s
+	if d > 60*time.Second {
+		d = 60 * time.Second
+	}
+	return d
+}
+
 func (c *Consumer) decide(ctx context.Context, m Message) (Result, error) {
-	cmd, err := Command(m.Body)
+	env, cmd, err := Parse(m.Body)
 	if err != nil {
 		return ResultPoison, err
 	}
+	// Mesma identidade (messageId do envelope) com conteúdo diferente é
+	// detectada pelo hash do corpo recebido.
 	sum := sha256.Sum256([]byte(m.Body))
 	out, err := c.proc.SubmitMessage(ctx, wagering.InboxMessage{
-		Consumer: ConsumerName, MessageID: m.ID, PayloadHash: hex.EncodeToString(sum[:]),
+		Consumer: ConsumerName, MessageID: env.MessageID, PayloadHash: hex.EncodeToString(sum[:]),
 	}, cmd)
 	switch {
 	case err == nil && out.DuplicateMessage:

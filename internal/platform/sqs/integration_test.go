@@ -96,9 +96,11 @@ func newRig(t *testing.T) *rig {
 		wager: wagerURL, dlq: dlqURL, events: eventsURL, wallet: w.ID(), player: w.PlayerID()}
 }
 
+// body monta o envelope WagerTransactionRequested. messageId = "msg-"+ext,
+// então reenviar o mesmo ext é a mesma mensagem lógica.
 func (r *rig) body(ext, amount string) string {
-	return fmt.Sprintf(`{"idempotencyKey":"k-%s","providerId":"prov","externalTransactionId":"%s","playerId":"%s","walletId":"%s","roundId":"r","gameId":"g","kind":"BET","money":{"amount":"%s","currency":"BRL"}}`,
-		ext, ext, r.player, r.wallet, amount)
+	return fmt.Sprintf(`{"messageId":"msg-%s-%s","type":"WagerTransactionRequested","occurredAt":"2026-10-08T12:00:00Z","data":{"idempotencyKey":"k-%s","providerId":"prov","externalTransactionId":"%s","playerId":"%s","walletId":"%s","roundId":"r","gameId":"g","kind":"BET","money":{"amount":"%s","currency":"BRL"}}}`,
+		r.wallet.String()[24:], ext, ext, ext, r.player, r.wallet, amount)
 }
 
 var sendSeq atomic.Int64

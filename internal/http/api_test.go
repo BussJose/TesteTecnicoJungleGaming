@@ -212,9 +212,35 @@ func TestSubmitFlow(t *testing.T) {
 		t.Fatalf("refund: %d %s", ok.Code, ok.Raw)
 	}
 	// consulta por id externo (do próprio provedor)
-	g := e.do("GET", "/wagering/transactions/b1", provider, "", "")
+	g := e.do("GET", "/providers/provider-a/wagering/transactions/b1", provider, "", "")
 	if g.Code != 200 || g.str("status") != "PROCESSED" {
 		t.Fatalf("get: %d %s", g.Code, g.Raw)
+	}
+	// consulta por id interno
+	byID := e.do("GET", "/wagering/transactions/"+g.str("transactionId"), provider, "", "")
+	if byID.Code != 200 || byID.str("externalTransactionId") != "b1" {
+		t.Fatalf("get by id: %d %s", byID.Code, byID.Raw)
+	}
+	// a leitura mostra a transação pendente e o código de rejeição
+	if r := e.do("GET", "/providers/provider-a/wagering/transactions/rf1", provider, "", ""); r.Code != 200 || r.str("status") != "PENDING_REFERENCE" {
+		t.Fatalf("pending read: %d %s", r.Code, r.Raw)
+	}
+	if r := e.do("GET", "/providers/provider-a/wagering/transactions/b2", provider, "", ""); r.str("failureCode") != "INSUFFICIENT_FUNDS" {
+		t.Fatalf("rejected read: %d %s", r.Code, r.Raw)
+	}
+	// providerId no corpo é opcional, mas precisa ser o do token
+	withProv := func(pid string) string {
+		var m map[string]any
+		_ = json.Unmarshal([]byte(betBody("pv1", wallet, player, "BET", "1.00", "")), &m)
+		m["providerId"] = pid
+		raw, _ := json.Marshal(m)
+		return string(raw)
+	}
+	if r := e.do("POST", "/wagering/transactions", provider, "key-pv-bad", withProv("provider-b")); r.Code != 403 || r.str("error", "code") != "PROVIDER_MISMATCH" {
+		t.Fatalf("provider mismatch: %d %s", r.Code, r.Raw)
+	}
+	if r := e.do("POST", "/wagering/transactions", provider, "key-pv-ok", withProv("provider-a")); r.Code != 200 {
+		t.Fatalf("provider match: %d %s", r.Code, r.Raw)
 	}
 }
 
@@ -240,7 +266,6 @@ func TestSubmitValidation(t *testing.T) {
 		return string(raw)
 	}
 	cases := map[string]string{
-		"providerId in body":  with("providerId", "provider-b"),
 		"kind OPENING":        with("kind", "OPENING"),
 		"unknown kind":        with("kind", "FOO"),
 		"missing kind":        with("kind", nil),
@@ -276,12 +301,23 @@ func TestProviderIsolation(t *testing.T) {
 	a, b := e.idp.Provider("provider-a"), e.idp.Provider("provider-b")
 	wallet, player := e.openWallet("100.00")
 
-	if r := e.do("POST", "/wagering/transactions", a, "ka", betBody("same-id", wallet, player, "BET", "10.00", "")); r.Code != 200 {
-		t.Fatalf("a: %d %s", r.Code, r.Raw)
+	ra := e.do("POST", "/wagering/transactions", a, "ka", betBody("same-id", wallet, player, "BET", "10.00", ""))
+	if ra.Code != 200 {
+		t.Fatalf("a: %d %s", ra.Code, ra.Raw)
 	}
-	// provider-b não enxerga a transação de provider-a
-	if r := e.do("GET", "/wagering/transactions/same-id", b, "", ""); r.Code != 404 {
-		t.Fatalf("b sees a's transaction: %d %s", r.Code, r.Raw)
+	// provider-b não enxerga a transação de provider-a, por nenhuma das rotas
+	if r := e.do("GET", "/providers/provider-b/wagering/transactions/same-id", b, "", ""); r.Code != 404 {
+		t.Fatalf("b sees a's transaction by external id: %d %s", r.Code, r.Raw)
+	}
+	if r := e.do("GET", "/providers/provider-a/wagering/transactions/same-id", b, "", ""); r.Code != 403 {
+		t.Fatalf("b reads a's provider path: %d %s", r.Code, r.Raw)
+	}
+	if r := e.do("GET", "/wagering/transactions/"+ra.str("transactionId"), b, "", ""); r.Code != 404 {
+		t.Fatalf("b sees a's transaction by id: %d %s", r.Code, r.Raw)
+	}
+	// repetir a requisição de a não vaza nada para b e continua sendo replay de a
+	if r := e.do("POST", "/wagering/transactions", a, "ka", betBody("same-id", wallet, player, "BET", "10.00", "")); r.Code != 200 || r.Body["idempotentReplay"] != true {
+		t.Fatalf("a replay: %d %s", r.Code, r.Raw)
 	}
 	// o mesmo id externo para outro provedor é outra operação
 	if r := e.do("POST", "/wagering/transactions", b, "kb", betBody("same-id", wallet, player, "BET", "10.00", "")); r.Code != 200 ||
@@ -327,8 +363,9 @@ func TestLedgerAndReconciliation(t *testing.T) {
 		}
 	}
 	rc := e.do("POST", "/wallets/"+wallet+"/reconciliation", tok, "", "")
-	if rc.Code != 200 || rc.Body["consistent"] != true || rc.str("walletBalance", "amount") != "70.00" ||
-		rc.str("ledgerBalance", "amount") != "70.00" || rc.Body["ledgerEntries"].(float64) != 3 {
+	if rc.Code != 200 || rc.Body["consistent"] != true || rc.str("storedBalance", "amount") != "70.00" ||
+		rc.str("calculatedBalance", "amount") != "70.00" || rc.str("difference", "amount") != "0.00" ||
+		rc.Body["checkedEntries"].(float64) != 3 {
 		t.Fatalf("reconciliation: %d %s", rc.Code, rc.Raw)
 	}
 }
